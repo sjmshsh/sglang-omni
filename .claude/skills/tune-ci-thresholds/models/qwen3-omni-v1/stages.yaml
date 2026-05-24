@@ -405,8 +405,7 @@ tts_wer:
   test: tests/test_model/test_qwen3_omni_tts_ci.py
   title: "TTS Wer"
   group: wer
-  extra_env:
-    SGLANG_SEEDTTS50_DIR: "/github/home/seedtts-50"
+  extra_env: {}
   context_vars:
     - MAX_SAMPLES
     - CONCURRENCY
@@ -444,8 +443,7 @@ tts_speed:
   test: tests/test_model/test_qwen3_omni_tts_ci.py
   title: "TTS Speed"
   group: speed
-  extra_env:
-    SGLANG_SEEDTTS50_DIR: "/github/home/seedtts-50"
+  extra_env: {}
   context_vars:
     - MAX_SAMPLES
     - CONCURRENCY

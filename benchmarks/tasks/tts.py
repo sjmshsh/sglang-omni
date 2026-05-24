@@ -316,6 +316,7 @@ class SeedttsSimilarityConfig(Protocol):
 
     model: str
     meta: str
+    lang: str
     output_dir: str
     device: str
     similarity_checkpoint: str | None
@@ -333,9 +334,10 @@ def run_seedtts_similarity(
         generated: list[dict] = json.load(f)
     logger.info(f"Loaded {len(generated)} entries from {generated_path}")
 
+    split = config.lang
     ref_audio_by_id = {
         sample.sample_id: sample.ref_audio
-        for sample in load_seedtts_samples(config.meta)
+        for sample in load_seedtts_samples(config.meta, split=split)
     }
     device = config.device
     if "cuda" in device:

@@ -5,7 +5,7 @@ hf_model_id: "Qwen/Qwen3-Omni-30B-A3B-Instruct"
 hf_datasets:
   - "zhaochenyang20/mmsu-ci-2000"
   - "zhaochenyang20/mmmu-ci-50"
-  - "zhaochenyang20/seed-tts-eval-50"
+  - "zhaochenyang20/seed-tts-eval-50-arrow"
   - "zhaochenyang20/Video_MME_ci"
   - "zhaochenyang20/Video_AMME_ci"
 default_venv_python:
@@ -37,9 +37,7 @@ gpus_per_test:
 test_globs:
   - "tests/test_model/test_qwen3_omni_*_ci.py"
 # Per-test extra env vars. Key is the test filename (basename).
-extra_env:
-  test_qwen3_omni_tts_ci.py:
-    SGLANG_SEEDTTS50_DIR: "/github/home/seedtts-50"
+extra_env: {}
 # Stage-key base derivation: strip prefix + strip suffix from the test stem.
 stage_base_strip_prefix: "test_qwen3_omni_"
 stage_base_strip_suffix: "_ci"

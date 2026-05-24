@@ -26,13 +26,13 @@ Usage:
 
     # Full pipeline (generate + transcribe) — voice cloning
     python -m benchmarks.eval.benchmark_tts_seedtts \
-        --meta seedtts_testset/en/meta.lst \
+        --meta zhaochenyang20/seed-tts-eval-arrow \
         --max-concurrency 16 \
         --model fishaudio/s2-pro --port 8000
 
     # Full pipeline — plain TTS (no ref audio from testset)
     python -m benchmarks.eval.benchmark_tts_seedtts \
-        --meta seedtts_testset/en/meta.lst \
+        --meta zhaochenyang20/seed-tts-eval-arrow \
         --model mistralai/Voxtral-4B-TTS-2603 --port 8000 \
         --max-concurrency 16 \
         --no-ref-audio --voice cheerful_female --max-samples 50
@@ -44,7 +44,7 @@ Usage (CI):
     # Generate audio only
     python -m benchmarks.eval.benchmark_tts_seedtts \
         --generate-only \
-        --meta seedtts_testset/en/meta.lst \
+        --meta zhaochenyang20/seed-tts-eval-arrow \
         --max-concurrency 16 \
         --output-dir results/s2pro_en \
         --model fishaudio/s2-pro --port 8000
@@ -52,7 +52,7 @@ Usage (CI):
     # Transcribe + WER only
     python -m benchmarks.eval.benchmark_tts_seedtts \
         --transcribe-only \
-        --meta seedtts_testset/en/meta.lst \
+        --meta zhaochenyang20/seed-tts-eval-arrow \
         --model fishaudio/s2-pro \
         --output-dir results/s2pro_en \
         --lang en --device cuda:0
@@ -224,13 +224,10 @@ async def run_tts_seedtts_benchmark(
 
     Returns a dict with keys: summary, per_request, config.
     """
-    if not os.path.isfile(config.meta):
-        raise FileNotFoundError(f"Meta file not found: {config.meta}")
-
     base_url = build_base_url(config)
     api_url = f"{base_url}/v1/audio/speech"
 
-    samples = load_seedtts_samples(config.meta, config.max_samples)
+    samples = load_seedtts_samples(config.meta, config.max_samples, split=config.lang)
     logger.info(f"Prepared {len(samples)} requests")
 
     save_audio_dir = os.path.abspath(os.path.join(config.output_dir, "audio"))
@@ -362,8 +359,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--testset",
         dest="meta",
         type=str,
-        default="seedtts_testset/en/meta.lst",
-        help="Path to a meta.lst file (seed-tts-eval format).",
+        default="zhaochenyang20/seed-tts-eval-arrow",
+        help="HuggingFace Arrow/Parquet dataset repo id or local meta.lst path.",
     )
     parser.add_argument(
         "--no-ref-audio",

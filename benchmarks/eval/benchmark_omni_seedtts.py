@@ -22,7 +22,7 @@ Usage:
 
     # Full pipeline (generate + transcribe)
     python -m benchmarks.eval.benchmark_omni_seedtts \
-        --meta seedtts_testset/en/meta.lst \
+        --meta zhaochenyang20/seed-tts-eval-arrow \
         --output-dir results/qwen3_omni_en \
         --max-concurrency 16 \
         --model qwen3-omni --port 8000 --max-samples 50
@@ -32,7 +32,7 @@ CI Usage:
     # Generate audio only (server must be running)
     python -m benchmarks.eval.benchmark_omni_seedtts \
         --generate-only \
-        --meta seedtts_testset/en/meta.lst \
+        --meta zhaochenyang20/seed-tts-eval-arrow \
         --output-dir results/qwen3_omni_en \
         --max-concurrency 16 \
         --model qwen3-omni --port 8000 --max-samples 50
@@ -40,7 +40,7 @@ CI Usage:
     # Transcribe + WER only (server not needed)
     python -m benchmarks.eval.benchmark_omni_seedtts \
         --transcribe-only \
-        --meta seedtts_testset/en/meta.lst \
+        --meta zhaochenyang20/seed-tts-eval-arrow \
         --output-dir results/qwen3_omni_en \
         --model qwen3-omni --lang en --device cuda:0
 
@@ -303,13 +303,10 @@ async def run_omni_seedtts_benchmark(
 
     Returns a dict with keys: summary, per_request, config.
     """
-    if not os.path.isfile(config.meta):
-        raise FileNotFoundError(f"Meta file not found: {config.meta}")
-
     base_url = build_base_url(config)
     api_url = f"{base_url}/v1/chat/completions"
 
-    samples = load_seedtts_samples(config.meta, config.max_samples)
+    samples = load_seedtts_samples(config.meta, config.max_samples, split=config.lang)
     logger.info(f"Prepared {len(samples)} requests")
 
     save_audio_dir = os.path.abspath(os.path.join(config.output_dir, "audio"))
@@ -429,8 +426,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--testset",
         dest="meta",
         type=str,
-        default="seedtts_testset/en/meta.lst",
-        help="Path to a meta.lst file (seed-tts-eval format).",
+        default="zhaochenyang20/seed-tts-eval-arrow",
+        help="HuggingFace Arrow/Parquet dataset repo id or local meta.lst path.",
     )
     parser.add_argument(
         "--lang",

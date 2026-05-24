@@ -73,7 +73,6 @@ STARTUP_TIMEOUT = 180
 BENCHMARK_TIMEOUT = 600
 WER_TIMEOUT = 600
 SIMILARITY_TIMEOUT = 600
-DATASET_CACHE_ENV = "SGLANG_SEEDTTS50_DIR"
 # Optional user override: a path to a custom fine-tuned WavLM checkpoint.
 # When unset, the bootstrapper in benchmarks.metrics.speaker_similarity_assets
 # auto-downloads the official weights into the shared cache directory.
@@ -179,7 +178,7 @@ def _run_benchmark(
 
 
 def _run_wer_transcribe(
-    meta_path: str,
+    meta: str,
     output_dir: str,
     *,
     stream: bool = False,
@@ -193,7 +192,7 @@ def _run_wer_transcribe(
         WER_MODULE,
         "--transcribe-only",
         "--meta",
-        meta_path,
+        meta,
         "--output-dir",
         output_dir,
         "--model",
@@ -247,7 +246,7 @@ def _run_wer_transcribe(
 
 
 def _run_similarity(
-    meta_path: str,
+    meta: str,
     output_dir: str,
     checkpoint_path: str | None,
     *,
@@ -260,7 +259,7 @@ def _run_similarity(
         WER_MODULE,
         "--similarity-only",
         "--meta",
-        meta_path,
+        meta,
         "--output-dir",
         output_dir,
         "--model",
@@ -442,7 +441,7 @@ def _generate_consistency_inputs(
     # started when stage 3 actually needs to generate its own inputs (local
     # dev path).  In CI the artifact path returns early above.
     router_server = request.getfixturevalue("router_server")
-    dataset_dir = request.getfixturevalue("dataset_dir")
+    dataset_repo = request.getfixturevalue("dataset_repo")
     output_root = tmp_path_factory.mktemp("s2pro_consistency")
     for concurrency in selected_s2pro_tts_concurrencies:
         non_stream_key = f"vc_nonstream_c{concurrency}"
@@ -452,7 +451,7 @@ def _generate_consistency_inputs(
             output_dir = str(output_root / f"vc_nonstream_c{concurrency}")
             results = _run_benchmark(
                 router_server.port,
-                str(dataset_dir / "en" / "meta.lst"),
+                dataset_repo,
                 output_dir,
                 concurrency=concurrency,
             )
@@ -467,7 +466,7 @@ def _generate_consistency_inputs(
             output_dir = str(output_root / f"vc_stream_c{concurrency}")
             results = _run_benchmark(
                 router_server.port,
-                str(dataset_dir / "en" / "meta.lst"),
+                dataset_repo,
                 output_dir,
                 concurrency=concurrency,
                 max_samples=STREAMING_BENCHMARK_MAX_SAMPLES,
@@ -498,14 +497,10 @@ def _print_stage(stage: str, mode: str, concurrency: int, details: str = "") -> 
 
 
 @pytest.fixture(scope="module")
-def dataset_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
-    override_dir = os.environ.get(DATASET_CACHE_ENV)
-    if override_dir:
-        root = Path(override_dir).expanduser()
-    else:
-        root = tmp_path_factory.mktemp("seed_tts_eval") / "data"
-    download_dataset(DATASETS["seedtts-50"], str(root), quiet=True)
-    return root
+def dataset_repo() -> str:
+    repo_id = DATASETS["seedtts-50"]
+    download_dataset(repo_id, quiet=True)
+    return repo_id
 
 
 @pytest.fixture(scope="module")
@@ -585,7 +580,7 @@ def wer_input_dirs(
 @pytest.mark.benchmark
 def test_voice_cloning_non_streaming(
     router_server: ManagedRouterHandle,
-    dataset_dir: Path,
+    dataset_repo: str,
     tmp_path: Path,
     selected_s2pro_tts_concurrencies: tuple[int, ...],
 ) -> None:
@@ -599,7 +594,7 @@ def test_voice_cloning_non_streaming(
         try:
             results = _run_benchmark(
                 router_server.port,
-                str(dataset_dir / "en" / "meta.lst"),
+                dataset_repo,
                 output_dir,
                 concurrency=concurrency,
             )
@@ -630,7 +625,7 @@ def test_voice_cloning_non_streaming(
 @pytest.mark.benchmark
 def test_voice_cloning_streaming(
     router_server: ManagedRouterHandle,
-    dataset_dir: Path,
+    dataset_repo: str,
     tmp_path: Path,
     selected_s2pro_tts_concurrencies: tuple[int, ...],
 ) -> None:
@@ -646,7 +641,7 @@ def test_voice_cloning_streaming(
         try:
             results = _run_benchmark(
                 router_server.port,
-                str(dataset_dir / "en" / "meta.lst"),
+                dataset_repo,
                 output_dir,
                 concurrency=concurrency,
                 max_samples=STREAMING_BENCHMARK_MAX_SAMPLES,
@@ -702,7 +697,7 @@ def test_voice_cloning_streaming_consistency(
 @pytest.mark.benchmark
 def test_voice_cloning_wer(
     wer_input_dirs: dict[str, dict[int, str]],
-    dataset_dir: Path,
+    dataset_repo: str,
     selected_s2pro_tts_concurrencies: tuple[int, ...],
 ) -> None:
     checks = MetricCheckCollector("S2-Pro non-streaming WER")
@@ -714,7 +709,7 @@ def test_voice_cloning_wer(
             "transcribe speed-stage WAVs",
         )
         results = _run_wer_transcribe(
-            str(dataset_dir / "en" / "meta.lst"),
+            dataset_repo,
             wer_input_dirs["non_stream"][concurrency],
         )
         assert_wer_results(
@@ -730,7 +725,7 @@ def test_voice_cloning_wer(
 @pytest.mark.benchmark
 def test_voice_cloning_similarity(
     wer_input_dirs: dict[str, dict[int, str]],
-    dataset_dir: Path,
+    dataset_repo: str,
     similarity_checkpoint: str | None,
     selected_s2pro_tts_concurrencies: tuple[int, ...],
 ) -> None:
@@ -743,7 +738,7 @@ def test_voice_cloning_similarity(
             "score speed-stage WAVs",
         )
         results = _run_similarity(
-            str(dataset_dir / "en" / "meta.lst"),
+            dataset_repo,
             wer_input_dirs["non_stream"][concurrency],
             similarity_checkpoint,
         )
@@ -755,7 +750,7 @@ def test_voice_cloning_similarity(
 @pytest.mark.benchmark
 def test_voice_cloning_streaming_wer(
     wer_input_dirs: dict[str, dict[int, str]],
-    dataset_dir: Path,
+    dataset_repo: str,
     selected_s2pro_tts_concurrencies: tuple[int, ...],
 ) -> None:
     checks = MetricCheckCollector("S2-Pro streaming WER")
@@ -767,7 +762,7 @@ def test_voice_cloning_streaming_wer(
             f"transcribe {STREAMING_BENCHMARK_MAX_SAMPLES} speed-stage WAVs",
         )
         results = _run_wer_transcribe(
-            str(dataset_dir / "en" / "meta.lst"),
+            dataset_repo,
             wer_input_dirs["stream"][concurrency],
             stream=True,
         )
