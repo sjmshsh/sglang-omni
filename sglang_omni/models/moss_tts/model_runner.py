@@ -7,6 +7,11 @@ from typing import Any
 
 import torch
 import torch.nn.functional as F
+from sglang.srt.layers.logits_processor import LogitsMetadata
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardMode,
+)
 from sglang.srt.managers.schedule_batch import FINISH_MATCHED_TOKEN
 
 from sglang_omni.model_runner.base import ModelRunner
@@ -68,6 +73,18 @@ class MossTTSModelRunner(ModelRunner):
         del forward_batch, schedule_batch, requests
         return True
 
+    def requested_capture_hidden_mode_prefill(
+        self, schedule_batch: Any, requests: list
+    ) -> Any | None:
+        del schedule_batch, requests
+        return CaptureHiddenMode.LAST
+
+    def requested_capture_hidden_mode_decode(
+        self, schedule_batch: Any, requests: list
+    ) -> Any | None:
+        del schedule_batch, requests
+        return CaptureHiddenMode.LAST
+
     def _build_prefill_input_embeds(
         self,
         forward_batch: Any,
@@ -116,7 +133,19 @@ class MossTTSModelRunner(ModelRunner):
         text_logits = logits_output.next_token_logits
         audio_logits = getattr(logits_output, "moss_tts_audio_logits", None)
         if audio_logits is None:
-            raise RuntimeError("MOSS-TTS model did not return audio logits")
+            audio_logits = self._recover_audio_logits(logits_output)
+        if audio_logits is None:
+            hidden_states = getattr(logits_output, "hidden_states", None)
+            hidden_shape = (
+                tuple(hidden_states.shape)
+                if isinstance(hidden_states, torch.Tensor)
+                else None
+            )
+            raise RuntimeError(
+                "MOSS-TTS model did not return audio logits "
+                f"(output_type={type(logits_output).__name__}, "
+                f"hidden_states_shape={hidden_shape})"
+            )
 
         next_text_tokens: list[torch.Tensor] = []
         for row_idx, sched_req in enumerate(requests):
@@ -135,6 +164,27 @@ class MossTTSModelRunner(ModelRunner):
             next_text_tokens.append(text_token)
 
         return torch.stack(next_text_tokens, dim=0).to(torch.long)
+
+    def _recover_audio_logits(self, logits_output: Any) -> torch.Tensor | None:
+        """Rebuild audio logits when graph runners strip custom output fields."""
+
+        hidden_states = getattr(logits_output, "hidden_states", None)
+        if hidden_states is None:
+            return None
+        if hidden_states.ndim != 2:
+            return None
+
+        metadata = LogitsMetadata(forward_mode=ForwardMode.DECODE)
+        audio_logits = []
+        for idx in range(1, self.model.config.channels):
+            logits = self.model.logits_processors[idx]._get_logits(
+                hidden_states,
+                self.model.lm_heads[idx],
+                metadata,
+            )
+            logits[..., self.model.config.audio_pad_code] = float("-inf")
+            audio_logits.append(logits)
+        return torch.stack(audio_logits, dim=1)
 
     def _sample_one_row(
         self,

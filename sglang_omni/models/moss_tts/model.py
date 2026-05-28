@@ -5,13 +5,18 @@ from __future__ import annotations
 
 import logging
 from copy import copy
+from dataclasses import dataclass, fields
 from typing import Iterable, Optional, Tuple
 
 import torch
 from torch import nn
 
 from sglang.srt.distributed import get_pp_group
-from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
+from sglang.srt.layers.logits_processor import (
+    LogitsMetadata,
+    LogitsProcessor,
+    LogitsProcessorOutput,
+)
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -26,6 +31,11 @@ from sglang.srt.utils import add_prefix
 from sglang_omni.models.moss_tts.hf_config import MossTTSDelayConfig
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class MossTTSLogitsOutput(LogitsProcessorOutput):
+    moss_tts_audio_logits: torch.Tensor | None = None
 
 
 class MossTTSDelayModel(nn.Module):
@@ -256,8 +266,14 @@ class MossTTSDelayModel(nn.Module):
             logits = out.next_token_logits
             logits[..., self.config.audio_pad_code] = float("-inf")
             audio_logits.append(logits)
-        text_out.moss_tts_audio_logits = torch.stack(audio_logits, dim=1)
-        return text_out
+        output_kwargs = {
+            field.name: getattr(text_out, field.name)
+            for field in fields(LogitsProcessorOutput)
+        }
+        return MossTTSLogitsOutput(
+            **output_kwargs,
+            moss_tts_audio_logits=torch.stack(audio_logits, dim=1),
+        )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
         stacked_params_mapping = [
