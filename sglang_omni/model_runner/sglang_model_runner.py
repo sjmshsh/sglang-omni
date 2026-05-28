@@ -91,6 +91,7 @@ class SGLModelRunner(ModelRunner):
             register_ming_hf_config,
             register_ming_model_registry,
         )
+        from sglang_omni.models.moss_tts.model import MossTTSDelayModel
         from sglang_omni.models.qwen3_omni.components.sglang_thinker import (
             Qwen3OmniThinkerForCausalLM,
         )
@@ -109,6 +110,8 @@ class SGLModelRunner(ModelRunner):
         ModelRegistry.models["HiggsMultimodalQwen3ForConditionalGeneration"] = (
             HiggsTTSModel
         )
+        ModelRegistry.models["MossTTSDelayModel"] = MossTTSDelayModel
+        ModelRegistry.models["MossTTSDelay"] = MossTTSDelayModel
         ModelRegistry.models["Qwen3TTSTalker"] = Qwen3TTSTalker
         ModelRegistry.models["VoxtralSGLangTTSModel"] = VoxtralSGLangTTSModel
         ModelRegistry.models["LLaDA2MoeModelLM"] = LLaDA2MoeModelLM

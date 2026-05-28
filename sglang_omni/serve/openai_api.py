@@ -658,6 +658,16 @@ def build_speech_generate_request(
         tts_params["language"] = req.language
     if req.instructions is not None:
         tts_params["instructions"] = req.instructions
+    for field in (
+        "token_count",
+        "duration_tokens",
+        "quality",
+        "sound_event",
+        "ambient_sound",
+    ):
+        value = getattr(req, field)
+        if value is not None:
+            tts_params[field] = value
     if req.ref_audio is not None:
         tts_params["ref_audio"] = req.ref_audio
     if req.ref_text is not None:

@@ -94,6 +94,7 @@ default_server_profile: qwen3_omni_colocated_router
 
 server_profile_by_hf_model_id:
   fishaudio/s2-pro: s2pro_router
+  OpenMOSS-Team/MOSS-TTS-v1.5: moss_tts_router
 
 server_profiles:
   qwen3_omni_colocated_router:
@@ -131,6 +132,15 @@ server_profiles:
     worker_extra_args: "--config {repo_root}/examples/configs/s2pro_tts.yaml"
     wait_timeout: 180
     server_boot_timeout_s: 240
+    router_policy: least_request
+  moss_tts_router:
+    server_gpus: 1
+    model_name: OpenMOSS-Team/MOSS-TTS-v1.5
+    num_workers: 1
+    num_gpus_per_worker: 1
+    worker_extra_args: "--config {repo_root}/examples/configs/moss_tts.yaml"
+    wait_timeout: 600
+    server_boot_timeout_s: 720
     router_policy: least_request
 
 rows:
@@ -514,6 +524,101 @@ rows:
       wer_per_sample_max:    { path: "wer.summary.wer_per_sample_max",    format: "{v:.2%}" }
       n_above_50_pct_wer:    { path: "wer.summary.n_above_50_pct_wer",    format: "{v}" }
       audio_duration_mean_s: { path: "wer.summary.audio_duration_mean_s", format: "{v:.3f}" }
+
+  # ===================== moss tts (separate model, OpenMOSS-Team/MOSS-TTS-v1.5) =====================
+  - id: moss-tts-en-stream-false-c16-accuracy
+    file: "benchmarks/eval/benchmark_tts_seedtts.py"
+    hf_model_id: "OpenMOSS-Team/MOSS-TTS-v1.5"
+    locate:
+      section_substring: "Accuracy (accuracy.wer)"
+      config_substring: "EN, stream=False"
+      source_workload: "router, 1-worker, full-set, c=16, no sampling"
+    client: "python -m benchmarks.eval.benchmark_tts_seedtts --model OpenMOSS-Team/MOSS-TTS-v1.5 --port {port} --meta zhaochenyang20/seed-tts-eval-arrow --max-concurrency 16 --lang en --output-dir {output_dir} --device {asr_gpu} --ref-format references --temperature 0 --top-p 1 --top-k -1 --repetition-penalty 1 --with-similarity"
+    result_json: "wer_results.json"
+    cells:
+      wer_corpus:            { path: "summary.wer_corpus",            format: "{v:.2%}" }
+      wer_per_sample_mean:   { path: "summary.wer_per_sample_mean",   format: "{v:.2%}" }
+      wer_per_sample_median: { path: "summary.wer_per_sample_median", format: "{v:.2%}" }
+      wer_per_sample_std:    { path: "summary.wer_per_sample_std",    format: "{v:.1%}" }
+      evaluated:             { paths: { v: "summary.evaluated", t: "summary.total_samples" }, format: "{v}/{t}" }
+      skipped:               { path: "summary.skipped", format: "{v}" }
+
+  - id: moss-tts-zh-stream-false-c16-accuracy
+    file: "benchmarks/eval/benchmark_tts_seedtts.py"
+    hf_model_id: "OpenMOSS-Team/MOSS-TTS-v1.5"
+    locate:
+      section_substring: "Accuracy (accuracy.wer)"
+      config_substring: "ZH, stream=False"
+      source_workload: "router, 1-worker, full-set, c=16, no sampling"
+    client: "python -m benchmarks.eval.benchmark_tts_seedtts --model OpenMOSS-Team/MOSS-TTS-v1.5 --port {port} --meta zhaochenyang20/seed-tts-eval-arrow --max-concurrency 16 --lang zh --output-dir {output_dir} --device {asr_gpu} --ref-format references --temperature 0 --top-p 1 --top-k -1 --repetition-penalty 1 --with-similarity"
+    result_json: "wer_results.json"
+    cells:
+      wer_corpus:            { path: "summary.wer_corpus",            format: "{v:.2%}" }
+      wer_per_sample_mean:   { path: "summary.wer_per_sample_mean",   format: "{v:.2%}" }
+      wer_per_sample_median: { path: "summary.wer_per_sample_median", format: "{v:.2%}" }
+      wer_per_sample_std:    { path: "summary.wer_per_sample_std",    format: "{v:.1%}" }
+      evaluated:             { paths: { v: "summary.evaluated", t: "summary.total_samples" }, format: "{v}/{t}" }
+      skipped:               { path: "summary.skipped", format: "{v}" }
+
+  - id: moss-tts-en-stream-false-c16-similarity
+    file: "benchmarks/eval/benchmark_tts_seedtts.py"
+    hf_model_id: "OpenMOSS-Team/MOSS-TTS-v1.5"
+    locate:
+      section_substring: "Speaker similarity (accuracy.similarity)"
+      config_substring: "EN"
+      source_workload: "router, 1-worker, full-set, c=16, no sampling"
+    client: "python -m benchmarks.eval.benchmark_tts_seedtts --model OpenMOSS-Team/MOSS-TTS-v1.5 --port {port} --meta zhaochenyang20/seed-tts-eval-arrow --max-concurrency 16 --lang en --output-dir {output_dir} --device {asr_gpu} --ref-format references --temperature 0 --top-p 1 --top-k -1 --repetition-penalty 1 --with-similarity"
+    result_json: "similarity_results.json"
+    cells:
+      speaker_similarity_mean: { path: "summary.speaker_similarity_mean", format: "{v:.2f}" }
+      evaluated:               { paths: { v: "summary.evaluated", t: "summary.total_samples" }, format: "{v}/{t}" }
+      skipped:                 { path: "summary.skipped", format: "{v}" }
+
+  - id: moss-tts-zh-stream-false-c16-similarity
+    file: "benchmarks/eval/benchmark_tts_seedtts.py"
+    hf_model_id: "OpenMOSS-Team/MOSS-TTS-v1.5"
+    locate:
+      section_substring: "Speaker similarity (accuracy.similarity)"
+      config_substring: "ZH"
+      source_workload: "router, 1-worker, full-set, c=16, no sampling"
+    client: "python -m benchmarks.eval.benchmark_tts_seedtts --model OpenMOSS-Team/MOSS-TTS-v1.5 --port {port} --meta zhaochenyang20/seed-tts-eval-arrow --max-concurrency 16 --lang zh --output-dir {output_dir} --device {asr_gpu} --ref-format references --temperature 0 --top-p 1 --top-k -1 --repetition-penalty 1 --with-similarity"
+    result_json: "similarity_results.json"
+    cells:
+      speaker_similarity_mean: { path: "summary.speaker_similarity_mean", format: "{v:.2f}" }
+      evaluated:               { paths: { v: "summary.evaluated", t: "summary.total_samples" }, format: "{v}/{t}" }
+      skipped:                 { path: "summary.skipped", format: "{v}" }
+
+  - id: moss-tts-en-stream-false-c16-speed
+    file: "benchmarks/eval/benchmark_tts_seedtts.py"
+    hf_model_id: "OpenMOSS-Team/MOSS-TTS-v1.5"
+    locate:
+      section_substring: "Generation speed (generation.speed)"
+      config_substring: "EN, stream=False"
+      source_workload: "router, 1-worker, full-set, c=16, no sampling"
+    client: "python -m benchmarks.eval.benchmark_tts_seedtts --generate-only --model OpenMOSS-Team/MOSS-TTS-v1.5 --port {port} --meta zhaochenyang20/seed-tts-eval-arrow --max-concurrency 16 --lang en --output-dir {output_dir} --ref-format references --temperature 0 --top-p 1 --top-k -1 --repetition-penalty 1"
+    result_json: "speed_results.json"
+    cells:
+      latency_mean_s: { path: "summary.latency_mean_s", format: "{v:.3f}" }
+      latency_p95_s:  { path: "summary.latency_p95_s",  format: "{v:.3f}" }
+      rtf_mean:       { path: "summary.rtf_mean",       format: "{v:.3f}" }
+      throughput_qps: { path: "summary.throughput_qps", format: "{v:.3f}" }
+      output_tok_per_req_s:  { path: "summary.output_tok_per_req_s",  format: "{v:.1f}" }
+
+  - id: moss-tts-zh-stream-false-c16-speed
+    file: "benchmarks/eval/benchmark_tts_seedtts.py"
+    hf_model_id: "OpenMOSS-Team/MOSS-TTS-v1.5"
+    locate:
+      section_substring: "Generation speed (generation.speed)"
+      config_substring: "ZH, stream=False"
+      source_workload: "router, 1-worker, full-set, c=16, no sampling"
+    client: "python -m benchmarks.eval.benchmark_tts_seedtts --generate-only --model OpenMOSS-Team/MOSS-TTS-v1.5 --port {port} --meta zhaochenyang20/seed-tts-eval-arrow --max-concurrency 16 --lang zh --output-dir {output_dir} --ref-format references --temperature 0 --top-p 1 --top-k -1 --repetition-penalty 1"
+    result_json: "speed_results.json"
+    cells:
+      latency_mean_s: { path: "summary.latency_mean_s", format: "{v:.3f}" }
+      latency_p95_s:  { path: "summary.latency_p95_s",  format: "{v:.3f}" }
+      rtf_mean:       { path: "summary.rtf_mean",       format: "{v:.3f}" }
+      throughput_qps: { path: "summary.throughput_qps", format: "{v:.3f}" }
+      output_tok_per_req_s:  { path: "summary.output_tok_per_req_s",  format: "{v:.1f}" }
 
   # ===================== s2-pro tts (separate model, fishaudio/s2-pro) =====================
   - id: s2pro-tts-en-stream-false-c16-accuracy

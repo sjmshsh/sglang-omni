@@ -189,6 +189,11 @@ class CreateSpeechRequest(BaseModel):
     task_type: str | None = None  # e.g. "Base", "CustomVoice", "VoiceDesign"
     language: str | None = None
     instructions: str | None = None  # style/emotion instructions
+    token_count: int | None = None  # MOSS-TTS ${token:N} equivalent
+    duration_tokens: int | None = None
+    quality: str | None = None
+    sound_event: str | None = None
+    ambient_sound: str | None = None
 
     # Voice cloning parameters
     ref_audio: str | None = None  # path or URL to reference audio

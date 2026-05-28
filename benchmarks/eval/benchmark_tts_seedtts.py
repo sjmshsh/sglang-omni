@@ -52,6 +52,15 @@ Usage:
         --output-dir results/higgs_tts_en \
         --lang en --max-concurrency 16
 
+    # Full pipeline — MOSS-TTS voice cloning, no sampling
+    python -m benchmarks.eval.benchmark_tts_seedtts \
+        --meta zhaochenyang20/seed-tts-eval-arrow \
+        --model OpenMOSS-Team/MOSS-TTS-v1.5 --port 8000 \
+        --ref-format references --temperature 0 --top-p 1 --top-k -1 \
+        --repetition-penalty 1 --with-similarity \
+        --output-dir results/moss_tts_en \
+        --lang en --max-concurrency 16
+
 For CI settings, separate the generate and transcribe phases into two runs.
 
 Usage (CI):
@@ -103,6 +112,8 @@ outlier-excluded corpus WER is 1.36%.
 | S2-Pro | ZH, stream=True  | 0.90%      | 0.86%               | 0.00%                 | 2.1%               | 2020/2020 | 0       | PR #411 [H100, full-set, c=16] |
 | Higgs TTS | EN, stream=False | 4.68%   | 4.16%               | 0.00%                 | 91.2%              | 1088/1088 | 0       | PR #534 [H200, full-set, c=16, CUDA Graph on, torch.compile off] |
 | Higgs TTS | ZH, stream=False | 1.14%   | 1.08%               | 0.00%                 | 2.7%               | 2020/2020 | 0       | PR #534 [H200, full-set, c=16, CUDA Graph on, torch.compile off] |
+| MOSS-TTS | EN, stream=False | --       | --                  | --                    | --                 | --        | --      | CI [H200, router, 1-worker, full-set, c=16, no sampling] |
+| MOSS-TTS | ZH, stream=False | --       | --                  | --                    | --                 | --        | --      | CI [H200, router, 1-worker, full-set, c=16, no sampling] |
 
 Generation speed (generation.speed)
 
@@ -122,6 +133,8 @@ Generation speed (generation.speed)
 | S2-Pro | ZH, stream=True  | 11.417         | 15.020        | 2.141    | 1.398          | 65.5                           | PR #411 [H100, V1-pipeline, full-set, c=16] |
 | Higgs TTS | EN, stream=False | 1.749       | 2.600         | 0.425    | 9.104          | 112.9                          | PR #534 [H200, full-set, c=16, CUDA Graph on, torch.compile off] |
 | Higgs TTS | ZH, stream=False | 1.629       | 2.110         | 0.282    | 9.792          | 109.9                          | PR #534 [H200, full-set, c=16, CUDA Graph on, torch.compile off] |
+| MOSS-TTS | EN, stream=False | --          | --            | --       | --             | --                             | CI [H200, router, 1-worker, full-set, c=16, no sampling] |
+| MOSS-TTS | ZH, stream=False | --          | --            | --       | --             | --                             | CI [H200, router, 1-worker, full-set, c=16, no sampling] |
 
 Note (Chenyang): output-token rates here count S2-Pro's codec tokens. They are not
 comparable to Qwen3-Omni rates in benchmark_omni_seedtts.py, whose tokens are
@@ -137,6 +150,13 @@ ASR speed (accuracy.asr_speed) — Whisper-large-v3 for EN, FunASR paraformer-zh
 | S2-Pro    | ZH   | 0.294              | 0.0556       | 3.40                         | PR #393 [H200, from S2-Pro ZH stream=False run] |
 | Higgs TTS | EN   | 0.360              | 0.0835       | 2.78                         | PR #534 [H200, from Higgs TTS EN stream=False run] |
 | Higgs TTS | ZH   | 0.0867             | 0.0157       | 11.53                        | PR #534 [H200, from Higgs TTS ZH stream=False run] |
+
+Speaker similarity (accuracy.similarity)
+
+| Model    | Lang | speaker_similarity_mean | evaluated | skipped | Source |
+| -------- | ---- | ----------------------- | --------- | ------- | ------ |
+| MOSS-TTS | EN   | --                      | --        | --      | CI [H200, router, 1-worker, full-set, c=16, no sampling] |
+| MOSS-TTS | ZH   | --                      | --        | --      | CI [H200, router, 1-worker, full-set, c=16, no sampling] |
 """
 
 from __future__ import annotations
@@ -208,6 +228,7 @@ class TtsSeedttsBenchmarkConfig:
     lang: str = "en"
     device: str = "cuda:0"
     similarity_checkpoint: str | None = None
+    with_similarity: bool = False
 
 
 def _build_generation_kwargs(config: TtsSeedttsBenchmarkConfig) -> dict:
@@ -355,6 +376,7 @@ def _config_from_args(args: argparse.Namespace) -> TtsSeedttsBenchmarkConfig:
         lang=args.lang,
         device=args.device,
         similarity_checkpoint=args.similarity_checkpoint,
+        with_similarity=args.with_similarity,
     )
 
 
@@ -487,6 +509,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "directory (override the cache root with SEEDTTS_SIM_CACHE_DIR).",
     )
     parser.add_argument(
+        "--with-similarity",
+        action="store_true",
+        help="After generation/transcription, also compute SeedTTS speaker similarity.",
+    )
+    parser.add_argument(
         "--server-timeout",
         type=int,
         default=1200,
@@ -535,6 +562,8 @@ def main() -> None:
         return
 
     run_tts_seedtts_transcribe(config)
+    if config.with_similarity:
+        run_seedtts_similarity(config)
 
 
 if __name__ == "__main__":
