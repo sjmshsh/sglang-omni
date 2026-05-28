@@ -204,48 +204,10 @@ class MossAudioTokenizerCodec:
     def decode_batch(self, codes_list: list[torch.Tensor]) -> list[torch.Tensor]:
         if not codes_list:
             return []
-        if len(codes_list) == 1:
-            return [self.decode(codes_list[0])]
-
-        device = self._model_device()
-        n_vq = int(codes_list[0].shape[1])
-        max_t = max(int(codes.shape[0]) for codes in codes_list)
-        audio_codes = torch.zeros(
-            (n_vq, len(codes_list), max_t),
-            device=device,
-            dtype=torch.long,
-        )
-        padding_mask = torch.zeros(
-            (len(codes_list), max_t),
-            device=device,
-            dtype=torch.bool,
-        )
-        for idx, codes in enumerate(codes_list):
-            if codes.ndim != 2 or int(codes.shape[1]) != n_vq:
-                raise ValueError(
-                    "All MOSS audio-code tensors must be [T, N] with the same N"
-                )
-            t = int(codes.shape[0])
-            audio_codes[:, idx, :t] = codes.transpose(0, 1).to(
-                device=device,
-                dtype=torch.long,
-            )
-            padding_mask[idx, :t] = True
-
-        dec = self.model.decode(
-            audio_codes,
-            padding_mask=padding_mask,
-            return_dict=True,
-            chunk_duration=8,
-        )
-        audio = dec.audio
-        lengths = dec.audio_lengths
-        if audio is None or lengths is None:
-            raise RuntimeError("MOSS-Audio-Tokenizer decode returned empty outputs")
-        return [
-            audio[idx, 0, : int(lengths[idx].item())].to(torch.float32).cpu()
-            for idx in range(len(codes_list))
-        ]
+        # The official MOSS-Audio-Tokenizer supports streaming decode
+        # (`chunk_duration`) only for batch_size=1, so keep the memory-friendly
+        # streaming path and iterate at this layer for concurrent requests.
+        return [self.decode(codes) for codes in codes_list]
 
 
 __all__ = [

@@ -8,13 +8,11 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 from sglang.srt.layers.logits_processor import LogitsMetadata
-from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
-    ForwardMode,
-)
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.managers.schedule_batch import FINISH_MATCHED_TOKEN
 
 from sglang_omni.model_runner.base import ModelRunner
+from sglang_omni.models.moss_tts.model import MOSS_TTS_AUDIO_LOGITS_KEY
 from sglang_omni.models.moss_tts.request_builders import (
     MOSS_TTS_DELAY_INF,
     MossTTSSGLangRequestData,
@@ -73,18 +71,6 @@ class MossTTSModelRunner(ModelRunner):
         del forward_batch, schedule_batch, requests
         return True
 
-    def requested_capture_hidden_mode_prefill(
-        self, schedule_batch: Any, requests: list
-    ) -> Any | None:
-        del schedule_batch, requests
-        return CaptureHiddenMode.LAST
-
-    def requested_capture_hidden_mode_decode(
-        self, schedule_batch: Any, requests: list
-    ) -> Any | None:
-        del schedule_batch, requests
-        return CaptureHiddenMode.LAST
-
     def _build_prefill_input_embeds(
         self,
         forward_batch: Any,
@@ -131,7 +117,7 @@ class MossTTSModelRunner(ModelRunner):
     ) -> torch.Tensor:
         del forward_batch, schedule_batch
         text_logits = logits_output.next_token_logits
-        audio_logits = getattr(logits_output, "moss_tts_audio_logits", None)
+        audio_logits = self._get_audio_logits(logits_output)
         if audio_logits is None:
             audio_logits = self._recover_audio_logits(logits_output)
         if audio_logits is None:
@@ -164,6 +150,18 @@ class MossTTSModelRunner(ModelRunner):
             next_text_tokens.append(text_token)
 
         return torch.stack(next_text_tokens, dim=0).to(torch.long)
+
+    @staticmethod
+    def _get_audio_logits(logits_output: Any) -> torch.Tensor | None:
+        audio_logits = getattr(logits_output, MOSS_TTS_AUDIO_LOGITS_KEY, None)
+        if audio_logits is not None:
+            return audio_logits
+        customized_info = getattr(logits_output, "customized_info", None)
+        if isinstance(customized_info, dict):
+            audio_logits = customized_info.get(MOSS_TTS_AUDIO_LOGITS_KEY)
+            if isinstance(audio_logits, torch.Tensor):
+                return audio_logits
+        return None
 
     def _recover_audio_logits(self, logits_output: Any) -> torch.Tensor | None:
         """Rebuild audio logits when graph runners strip custom output fields."""

@@ -31,6 +31,7 @@ from sglang.srt.utils import add_prefix
 from sglang_omni.models.moss_tts.hf_config import MossTTSDelayConfig
 
 logger = logging.getLogger(__name__)
+MOSS_TTS_AUDIO_LOGITS_KEY = "moss_tts_audio_logits"
 
 
 @dataclass
@@ -266,13 +267,17 @@ class MossTTSDelayModel(nn.Module):
             logits = out.next_token_logits
             logits[..., self.config.audio_pad_code] = float("-inf")
             audio_logits.append(logits)
+        audio_logits_tensor = torch.stack(audio_logits, dim=1)
+        customized_info = dict(text_out.customized_info or {})
+        customized_info[MOSS_TTS_AUDIO_LOGITS_KEY] = audio_logits_tensor
         output_kwargs = {
             field.name: getattr(text_out, field.name)
             for field in fields(LogitsProcessorOutput)
         }
+        output_kwargs["customized_info"] = customized_info
         return MossTTSLogitsOutput(
             **output_kwargs,
-            moss_tts_audio_logits=torch.stack(audio_logits, dim=1),
+            moss_tts_audio_logits=audio_logits_tensor,
         )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set[str]:
@@ -356,4 +361,4 @@ class MossTTSDelayModel(nn.Module):
         self.model.load_kv_cache_scales(quantization_param_path)
 
 
-__all__ = ["MossTTSDelayModel"]
+__all__ = ["MOSS_TTS_AUDIO_LOGITS_KEY", "MossTTSDelayModel"]
