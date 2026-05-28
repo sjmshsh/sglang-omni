@@ -4,13 +4,14 @@
 from __future__ import annotations
 
 import logging
+from copy import copy
 from typing import Iterable, Optional, Tuple
 
 import torch
 from torch import nn
 
 from sglang.srt.distributed import get_pp_group
-from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -88,10 +89,12 @@ class MossTTSDelayModel(nn.Module):
             for _ in range(config.channels):
                 self.lm_heads.append(PPMissingLayer())
 
-        self.logits_processors = [
-            LogitsProcessor(config, config.vocab_size_list, channel=idx)
-            for idx in range(config.channels)
-        ]
+        self.logits_processors = nn.ModuleList(
+            [
+                self._make_logits_processor(config, idx)
+                for idx in range(config.channels)
+            ]
+        )
         self._pad_token_per_channel = [
             int(config.pad_token_id),
             *[int(config.audio_pad_code)] * int(config.n_vq),
@@ -101,6 +104,29 @@ class MossTTSDelayModel(nn.Module):
             torch.empty(0, config.channels, dtype=torch.long),
             persistent=False,
         )
+
+    @staticmethod
+    def _make_logits_processor(
+        config: MossTTSDelayConfig,
+        channel: int,
+    ) -> LogitsProcessor:
+        """Build a channel-specific logits processor for current SGLang APIs."""
+
+        channel_config = copy(config)
+        channel_config.vocab_size = int(config.vocab_size_list[channel])
+        return LogitsProcessor(channel_config)
+
+    @staticmethod
+    def _audio_logits_metadata(forward_batch: ForwardBatch) -> LogitsMetadata:
+        metadata = LogitsMetadata.from_forward_batch(forward_batch)
+        metadata.next_token_logits_buffer = None
+        metadata.extend_return_logprob = False
+        metadata.extend_return_top_logprob = False
+        metadata.extend_token_ids_logprob = False
+        metadata.extend_input_logprob_token_ids_gpu = None
+        metadata.top_logprobs_nums = None
+        metadata.token_ids_logprobs = None
+        return metadata
 
     @property
     def start_layer(self):
@@ -219,12 +245,13 @@ class MossTTSDelayModel(nn.Module):
             logits_metadata=forward_batch,
         )
         audio_logits = []
+        audio_logits_metadata = self._audio_logits_metadata(forward_batch)
         for idx in range(1, self.config.channels):
             out = self.logits_processors[idx](
                 None,
                 hidden_states=hidden_states,
                 lm_head=self.lm_heads[idx],
-                logits_metadata=forward_batch,
+                logits_metadata=audio_logits_metadata,
             )
             logits = out.next_token_logits
             logits[..., self.config.audio_pad_code] = float("-inf")

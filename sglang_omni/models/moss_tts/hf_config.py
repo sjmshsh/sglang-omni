@@ -43,13 +43,16 @@ class MossTTSDelayConfig(PretrainedConfig):
         **kwargs: Any,
     ) -> None:
         kwargs.setdefault("tie_word_embeddings", False)
+        # Newer Transformers versions validate token ids inside
+        # PretrainedConfig.__init__ and may call get_text_config() there.
+        # Build the text config first so composition validation can see it.
+        self.language_config = _build_qwen3_config(language_config)
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=kwargs.pop("bos_token_id", None),
             eos_token_id=kwargs.pop("eos_token_id", im_end_token_id),
             **kwargs,
         )
-        self.language_config = _build_qwen3_config(language_config)
         self.initializer_range = initializer_range
         self.n_vq = int(n_vq)
         self.audio_vocab_size = int(audio_vocab_size)
@@ -114,4 +117,3 @@ def register_moss_tts_hf_config() -> None:
 
 
 __all__ = ["MossTTSDelayConfig", "register_moss_tts_hf_config"]
-
