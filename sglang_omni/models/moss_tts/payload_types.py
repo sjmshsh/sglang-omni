@@ -42,6 +42,7 @@ class MossTTSState:
 
     # tts_engine output
     output_codes: list[list[int]] | None = None
+    decode_start_length: int = 0
     prompt_tokens: int = 0
     completion_tokens: int = 0
     engine_time_s: float = 0.0
@@ -80,7 +81,12 @@ class MossTTSState:
             value = getattr(self, key)
             if value is not None:
                 data[key] = value
-        for key in ("prompt_tokens", "completion_tokens", "engine_time_s"):
+        for key in (
+            "decode_start_length",
+            "prompt_tokens",
+            "completion_tokens",
+            "engine_time_s",
+        ):
             value = getattr(self, key)
             if value:
                 data[key] = value
@@ -117,6 +123,7 @@ class MossTTSState:
             ),
             seed=data.get("seed"),
             output_codes=data.get("output_codes"),
+            decode_start_length=int(data.get("decode_start_length", 0)),
             prompt_tokens=int(data.get("prompt_tokens", 0)),
             completion_tokens=int(data.get("completion_tokens", 0)),
             engine_time_s=float(data.get("engine_time_s", 0.0)),
@@ -124,4 +131,3 @@ class MossTTSState:
 
 
 __all__ = ["MossTTSState"]
-

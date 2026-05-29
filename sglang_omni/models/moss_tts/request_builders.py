@@ -14,6 +14,7 @@ import torch
 
 from sglang_omni.models.moss_tts.hf_config import MossTTSDelayConfig
 from sglang_omni.models.moss_tts.payload_types import MossTTSState
+from sglang_omni.models.moss_tts.text_normalizer import normalize_tts_text
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.sglang_backend import SGLangARRequestData
 
@@ -31,6 +32,8 @@ class MossTTSSGLangRequestData(SGLangARRequestData):
 
     enforce_request_limits: bool = True
     prompt_channel_ids: torch.Tensor | None = None
+    assistant_prefix_rows: torch.Tensor | None = None
+    assistant_start_length: int = 0
     output_rows: list[torch.Tensor] = field(default_factory=list)
     last_input_ids: torch.Tensor | None = None
 
@@ -394,10 +397,18 @@ class MossTTSPromptBuilder:
         audio_start_token: str,
         audio_end_token: str,
     ) -> str:
-        if content.count(AUDIO_PLACEHOLDER) != len(lengths):
-            raise ValueError("Audio placeholders do not match provided references")
+        if n_vq < 1:
+            raise ValueError(f"n_vq must be >= 1, got {n_vq}")
+        num_placeholders = content.count(AUDIO_PLACEHOLDER)
+        if num_placeholders != len(lengths):
+            raise ValueError(
+                f"Number of {AUDIO_PLACEHOLDER} ({num_placeholders}) "
+                f"does not match lengths ({len(lengths)})"
+            )
 
         def build_audio_block(length: int) -> str:
+            if length < 0:
+                raise ValueError(f"length must be >= 0, got {length}")
             if length == 0:
                 return f"{audio_start_token}{audio_end_token}"
             return (
@@ -414,6 +425,46 @@ class MossTTSPromptBuilder:
             content,
         )
 
+    @staticmethod
+    def _merge_consecutive_audio_placeholders(
+        content: str,
+        audio_codes_list: list[torch.Tensor],
+    ) -> tuple[str, list[torch.Tensor]]:
+        matches = list(re.finditer(re.escape(AUDIO_PLACEHOLDER), content))
+        if len(matches) <= 1:
+            return content, audio_codes_list
+        if len(matches) != len(audio_codes_list):
+            raise ValueError("Audio placeholders do not match tokenizer output")
+
+        new_audio_codes_list: list[torch.Tensor] = []
+        new_parts: list[str] = []
+        last_pos = 0
+        idx = 0
+        while idx < len(matches):
+            end_idx = idx
+            while (
+                end_idx + 1 < len(matches)
+                and content[matches[end_idx].end() : matches[end_idx + 1].start()]
+                .strip()
+                == ""
+            ):
+                end_idx += 1
+
+            new_parts.append(content[last_pos : matches[idx].start()])
+            new_parts.append(AUDIO_PLACEHOLDER)
+            last_pos = matches[end_idx].end()
+
+            if end_idx == idx:
+                new_audio_codes_list.append(audio_codes_list[idx])
+            else:
+                new_audio_codes_list.append(
+                    torch.cat(audio_codes_list[idx : end_idx + 1], dim=0)
+                )
+            idx = end_idx + 1
+
+        new_parts.append(content[last_pos:])
+        return "".join(new_parts), new_audio_codes_list
+
     def _get_unified_codes(
         self,
         role: str,
@@ -426,6 +477,11 @@ class MossTTSPromptBuilder:
             gen_slot = self.audio_assistant_gen_slot_token
             delay_slot = self.audio_assistant_delay_slot_token
         n_vq = audio_codes_list[0].shape[1] if audio_codes_list else self.config.n_vq
+        if len(audio_codes_list) > 1 and AUDIO_PLACEHOLDER in content:
+            content, audio_codes_list = self._merge_consecutive_audio_placeholders(
+                content,
+                audio_codes_list,
+            )
         content = self._replace_audio_placeholders(
             content=content,
             lengths=[int(c.shape[0]) for c in audio_codes_list],
@@ -482,8 +538,7 @@ class MossTTSPromptBuilder:
 
 
 def _normalize_prompt_text(text: str) -> str:
-    # Preserve pinyin/IPA text and [pause Xs] controls; only normalise speaker tags.
-    return re.sub(r"\[(\d+)\]", r"[S\1]", str(text or "").replace("\n", " "))
+    return normalize_tts_text(str(text or ""))
 
 
 def _reference_fingerprint(prompt_rows: torch.Tensor) -> str | None:
@@ -518,6 +573,14 @@ def build_sglang_moss_tts_request(
             f"{tuple(prompt_rows.shape)}"
         )
     origin_input_ids = prompt_rows[:, 0].tolist()
+    im_start_idx = torch.where(prompt_rows[:, 0] == int(config.im_start_token_id))[0]
+    assistant_start_idx = (
+        int(im_start_idx[-1].item()) + 3
+        if im_start_idx.numel() > 0
+        else int(prompt_rows.shape[0])
+    )
+    assistant_start_idx = max(0, min(assistant_start_idx, int(prompt_rows.shape[0])))
+    assistant_prefix_rows = prompt_rows[assistant_start_idx:].clone()
 
     sampling_params = SamplingParams(
         max_new_tokens=int(state.max_new_tokens),
@@ -551,6 +614,8 @@ def build_sglang_moss_tts_request(
         input_ids=torch.tensor(origin_input_ids, dtype=torch.long),
         req=req,
         prompt_channel_ids=prompt_rows,
+        assistant_prefix_rows=assistant_prefix_rows,
+        assistant_start_length=int(assistant_prefix_rows.shape[0]),
         last_input_ids=prompt_rows[-1].clone(),
         is_audio=bool(is_continuation),
         audio_length=audio_length,
@@ -582,11 +647,21 @@ def build_sglang_moss_tts_request(
 
 def apply_moss_tts_result(state: MossTTSState, data: MossTTSSGLangRequestData) -> None:
     if data.output_rows:
-        rows = torch.stack(data.output_rows, dim=0).to(torch.long)
+        generated_rows = torch.stack(data.output_rows, dim=0).to(torch.long)
+        rows = generated_rows
+        if data.assistant_prefix_rows is not None and data.assistant_prefix_rows.numel():
+            rows = torch.cat(
+                [data.assistant_prefix_rows.to(torch.long), generated_rows],
+                dim=0,
+            )
+            state.decode_start_length = int(data.assistant_start_length)
+        else:
+            state.decode_start_length = 0
         state.output_codes = rows.tolist()
-        state.completion_tokens = int(rows.shape[0])
+        state.completion_tokens = int(generated_rows.shape[0])
     else:
         state.output_codes = None
+        state.decode_start_length = 0
     state.prompt_tokens = (
         int(data.prompt_channel_ids.shape[0])
         if data.prompt_channel_ids is not None
@@ -637,7 +712,7 @@ def extract_moss_tts_audio_segments(
     n_vq: int,
     audio_pad_code: int,
 ) -> list[torch.Tensor]:
-    """Extract de-delayed non-pad audio segments from generated MOSS rows."""
+    """Extract de-delayed non-pad audio segments from assistant MOSS rows."""
 
     if output_rows is None or output_rows.numel() == 0:
         return []
@@ -662,11 +737,8 @@ def extract_moss_tts_audio_segments(
     segments: list[torch.Tensor] = []
     for idx in chunks:
         segment = audio_codes[idx]
-        valid_rows = (segment != int(audio_pad_code)).all(dim=1)
-        segment = segment[valid_rows]
         if segment.numel() == 0:
             continue
-        segment = segment.clamp_(0, int(audio_pad_code) - 1)
         segments.append(segment.cpu())
     return segments
 

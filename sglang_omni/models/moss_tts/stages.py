@@ -249,17 +249,37 @@ def create_vocoder_executor(
 
     def _prepare_vocoder_item(
         payload: StagePayload,
-    ) -> tuple[MossTTSState, list[torch.Tensor]]:
+    ) -> tuple[MossTTSState, list[torch.Tensor], int]:
         state = load_state(payload)
         if not state.output_codes:
-            return state, []
+            return state, [], 0
         rows = torch.tensor(state.output_codes, dtype=torch.long)
         segments = extract_moss_tts_audio_segments(
             rows,
             n_vq=state.n_vq,
             audio_pad_code=state.audio_pad_code,
         )
-        return state, segments
+        return state, segments, int(state.decode_start_length)
+
+    def _trim_prompt_audio_context(
+        wavs: list[torch.Tensor],
+        segments: list[torch.Tensor],
+        start_length: int,
+    ) -> list[torch.Tensor]:
+        if start_length <= 0 or not wavs or not segments:
+            return wavs
+        first_codes_length = int(segments[0].shape[0])
+        if first_codes_length <= 0:
+            return wavs
+        trim_ratio = max(0.0, min(float(start_length) / first_codes_length, 1.0))
+        if trim_ratio >= 1.0:
+            return wavs[1:]
+        if trim_ratio <= 0.0:
+            return wavs
+        trimmed = list(wavs)
+        trim_samples = int(trimmed[0].shape[-1] * trim_ratio)
+        trimmed[0] = trimmed[0][..., trim_samples:]
+        return trimmed
 
     def _store_result(
         payload: StagePayload,
@@ -278,10 +298,13 @@ def create_vocoder_executor(
         return payload
 
     def _vocode(payload: StagePayload) -> StagePayload:
-        state, segments = _prepare_vocoder_item(payload)
+        state, segments, start_length = _prepare_vocoder_item(payload)
         if not segments:
             return _store_result(payload, state, None)
         wavs = codec.decode_batch(segments)
+        wavs = _trim_prompt_audio_context(wavs, segments, start_length)
+        if not wavs:
+            return _store_result(payload, state, None)
         waveform = torch.cat(wavs, dim=-1) if len(wavs) > 1 else wavs[0]
         return _store_result(payload, state, waveform)
 
@@ -289,15 +312,18 @@ def create_vocoder_executor(
         items = [_prepare_vocoder_item(payload) for payload in payloads]
         flat_segments: list[torch.Tensor] = []
         spans: list[tuple[int, int]] = []
-        for _, segments in items:
+        for _, segments, _start_length in items:
             start = len(flat_segments)
             flat_segments.extend(segments)
             spans.append((start, len(flat_segments)))
 
         decoded = codec.decode_batch(flat_segments) if flat_segments else []
         outputs: list[StagePayload] = []
-        for payload, (state, _segments), (start, end) in zip(payloads, items, spans):
+        for payload, (state, segments, start_length), (start, end) in zip(
+            payloads, items, spans
+        ):
             wavs = decoded[start:end]
+            wavs = _trim_prompt_audio_context(wavs, segments, start_length)
             waveform = None
             if wavs:
                 waveform = torch.cat(wavs, dim=-1) if len(wavs) > 1 else wavs[0]
