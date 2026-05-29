@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Pipeline configuration for MOSS-TTS."""
+"""Pipeline configuration for MOSS-TTS Delay."""
 
 from __future__ import annotations
 
@@ -11,16 +11,14 @@ _PKG = "sglang_omni.models.moss_tts"
 
 
 class MossTTSPipelineConfig(PipelineConfig):
-    """4-stage MOSS-TTS pipeline.
-
-    preprocessing -> audio_encoder -> tts_engine -> vocoder
-    """
+    """MOSS-TTS Delay pipeline: preprocessing -> AR engine -> vocoder."""
 
     architecture: ClassVar[str] = "MossTTSDelayModel"
     architecture_aliases: ClassVar[tuple[str, ...]] = (
         "MossTTSDelay",
+        "MossTTSDelayForConditionalGeneration",
         "MossTTSDelayWithCodec",
-        "MossTTSDdelayWithCodec",
+        "MossTTSDelayWithCodecModel",
     )
 
     model_path: str
@@ -29,21 +27,13 @@ class MossTTSPipelineConfig(PipelineConfig):
             name="preprocessing",
             process="pipeline",
             factory=f"{_PKG}.stages.create_preprocessing_executor",
-            next="audio_encoder",
-        ),
-        StageConfig(
-            name="audio_encoder",
-            process="pipeline",
-            factory=f"{_PKG}.stages.create_audio_encoder_executor",
-            factory_args={"device": "cuda"},
-            gpu=0,
             next="tts_engine",
         ),
         StageConfig(
             name="tts_engine",
             process="pipeline",
             factory=f"{_PKG}.stages.create_sglang_tts_engine_executor",
-            factory_args={"device": "cuda", "max_new_tokens": 2048},
+            factory_args={"gpu_id": 0, "dtype": "bfloat16"},
             gpu=0,
             next="vocoder",
         ),
@@ -51,7 +41,7 @@ class MossTTSPipelineConfig(PipelineConfig):
             name="vocoder",
             process="pipeline",
             factory=f"{_PKG}.stages.create_vocoder_executor",
-            factory_args={"device": "cuda"},
+            factory_args={"gpu_id": 0, "dtype": "float32"},
             gpu=0,
             terminal=True,
         ),

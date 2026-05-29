@@ -164,15 +164,7 @@ class SpeechReference(BaseModel):
     """Reference item for voice cloning in /v1/audio/speech."""
 
     audio_path: str | None = None
-    audio_data: str | None = None
-    audio: str | dict[str, Any] | None = None
-    base64: str | None = None
-    data: str | None = None
-    bytes: str | None = None
-    media_type: str | None = None
-    ref_audio: str | None = None
     text: str | None = None
-    reference_codes: list[list[int]] | None = None
     vq_codes: list[list[int]] | list[int] | None = None
 
 
@@ -197,17 +189,13 @@ class CreateSpeechRequest(BaseModel):
     task_type: str | None = None  # e.g. "Base", "CustomVoice", "VoiceDesign"
     language: str | None = None
     instructions: str | None = None  # style/emotion instructions
-    token_count: int | None = None  # MOSS-TTS ${token:N} equivalent
-    duration_tokens: int | None = None
-    quality: str | None = None
-    sound_event: str | None = None
-    ambient_sound: str | None = None
 
     # Voice cloning parameters
-    ref_audio: str | None = None  # path, URL, data URI, or base64 reference audio
-    audio_data: str | None = None  # MOSS-TTS-compatible reference audio field
+    ref_audio: str | None = None  # path or URL to reference audio
     ref_text: str | None = None  # transcript of reference audio
     references: list[SpeechReference] | None = None  # S2-Pro-style refs
+    token_count: int | None = None  # MOSS-TTS duration token target
+    duration_tokens: int | None = None  # alias for token_count
 
     # Generation parameters
     max_new_tokens: int | None = None

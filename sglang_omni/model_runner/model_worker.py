@@ -26,7 +26,7 @@ _ARCH_CONFIG_MAP: dict[str, tuple[str, str | None]] = {
     "Qwen3OmniTalker": ("talker_config", "text_config"),
     "Qwen3OmniThinkerForCausalLM": ("thinker_config", "text_config"),
     "Qwen3TTSTalker": ("talker_config", None),
-    "MossTTSDelayModel": ("language_config", None),
+    "MossTTSDelaySGLangModel": ("language_config", None),
 }
 
 
@@ -68,12 +68,6 @@ class ModelWorker:
             )
 
             register_ming_hf_config()
-        elif self.model_arch_override == "MossTTSDelayModel":
-            from sglang_omni.models.moss_tts.hf_config import (
-                register_moss_tts_hf_config,
-            )
-
-            register_moss_tts_hf_config()
 
         from sglang.srt.configs.model_config import ModelConfig
 

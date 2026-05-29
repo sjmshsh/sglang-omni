@@ -658,22 +658,14 @@ def build_speech_generate_request(
         tts_params["language"] = req.language
     if req.instructions is not None:
         tts_params["instructions"] = req.instructions
-    for field in (
-        "token_count",
-        "duration_tokens",
-        "quality",
-        "sound_event",
-        "ambient_sound",
-    ):
-        value = getattr(req, field)
-        if value is not None:
-            tts_params[field] = value
     if req.ref_audio is not None:
         tts_params["ref_audio"] = req.ref_audio
-    if req.audio_data is not None:
-        tts_params["audio_data"] = req.audio_data
     if req.ref_text is not None:
         tts_params["ref_text"] = req.ref_text
+    if req.token_count is not None:
+        tts_params["token_count"] = req.token_count
+    if req.duration_tokens is not None:
+        tts_params["duration_tokens"] = req.duration_tokens
     if req.seed is not None:
         tts_params["seed"] = req.seed
 
@@ -705,11 +697,6 @@ def build_speech_generate_request(
     # Backward compatibility with ref_audio/ref_text form.
     if req.ref_audio is not None:
         ref: dict[str, Any] = {"audio_path": req.ref_audio}
-        if req.ref_text is not None:
-            ref["text"] = req.ref_text
-        references.append(ref)
-    if req.audio_data is not None:
-        ref = {"audio_data": req.audio_data}
         if req.ref_text is not None:
             ref["text"] = req.ref_text
         references.append(ref)
