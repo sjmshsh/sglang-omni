@@ -19,6 +19,7 @@ class MossTTSModelRunner(ModelRunner):
         super().__init__(tp_worker, output_processor)
         self._pending_rows: torch.Tensor | None = None
         self._pending_embeds: torch.Tensor | None = None
+        self._audio_text_token_ids: dict[tuple[torch.device, bool], torch.Tensor] = {}
 
     def prepare_prefill(
         self,
@@ -106,26 +107,46 @@ class MossTTSModelRunner(ModelRunner):
             return
         embedding = self.model._decode_input_embedding
         weight = embedding.weight
+        graph_batch_size = int(getattr(forward_batch, "batch_size", batch_size))
+        if graph_batch_size < batch_size:
+            raise ValueError(
+                f"forward_batch.batch_size ({graph_batch_size}) < "
+                f"len(requests) ({batch_size})"
+            )
+        if graph_batch_size > int(weight.shape[0]):
+            raise ValueError(
+                "MOSS-TTS decode embedding table is smaller than the CUDA graph "
+                f"batch size ({weight.shape[0]} < {graph_batch_size})"
+            )
+
         rows = []
         for sched_req in requests:
             queue = sched_req.data.pending_feedback_queue
             if not queue:
-                rows.append(torch.zeros(self.model.hidden_size, device=weight.device))
+                rows.append(
+                    torch.zeros(self.model.hidden_size, device=weight.device)
+                )
                 continue
             if hasattr(queue, "popleft"):
                 rows.append(queue.popleft())
             else:
                 rows.append(queue.pop(0))
+        if graph_batch_size > batch_size:
+            pad = weight.new_zeros(
+                (graph_batch_size - batch_size, self.model.hidden_size)
+            )
+            rows.extend([row for row in pad])
+
         stacked = torch.stack(rows, dim=0).to(device=weight.device, dtype=weight.dtype)
         with torch.no_grad():
-            weight[:batch_size].copy_(stacked)
+            weight[:graph_batch_size].copy_(stacked)
 
         row_ids = torch.arange(
-            batch_size,
+            graph_batch_size,
             dtype=torch.long,
             device=forward_batch.input_ids.device,
         )
-        forward_batch.input_ids[:batch_size].copy_(row_ids)
+        forward_batch.input_ids[:graph_batch_size].copy_(row_ids)
 
     def _collect_moss_step(
         self,
@@ -141,7 +162,6 @@ class MossTTSModelRunner(ModelRunner):
 
         device = channel_logits[0].device
         rows = []
-        embeds = []
         text_tokens = []
         for row_idx, sched_req in enumerate(requests):
             data = sched_req.data
@@ -156,17 +176,14 @@ class MossTTSModelRunner(ModelRunner):
             row[1:] = audio_tokens
             rows.append(row)
             text_tokens.append(int(text_token))
-            embeds.append(
-                self.model._prepare_multi_modal_inputs(
-                    row.unsqueeze(0).to(device=self.model.device)
-                )[0].detach()
-            )
 
         next_token_ids = torch.tensor(text_tokens, dtype=torch.long, device=device)
         result.next_token_ids = next_token_ids
         schedule_batch.output_ids = next_token_ids
         self._pending_rows = torch.stack(rows, dim=0)
-        self._pending_embeds = torch.stack(embeds, dim=0)
+        self._pending_embeds = self.model._prepare_multi_modal_inputs(
+            self._pending_rows.to(device=self.model.device)
+        ).detach()
 
     def _channel_logits_from_result(
         self,
@@ -208,11 +225,7 @@ class MossTTSModelRunner(ModelRunner):
             data=data,
             n_vq=n_vq,
         )
-        sampling_audio_mask = self._sampling_audio_mask(data, n_vq=n_vq, device=device)
-        # Materialize the mask once (single host sync) instead of one .item()
-        # per codebook, and only rebuild the per-head history when the
-        # repetition penalty is actually active (it is 1.0 by default).
-        active = sampling_audio_mask.tolist()
+        active = self._sampling_audio_mask(data, n_vq=n_vq)
         rep_penalty = float(data.audio_repetition_penalty)
         for vq_idx in range(n_vq):
             if not active[vq_idx]:
@@ -244,29 +257,18 @@ class MossTTSModelRunner(ModelRunner):
             data.is_audio = False
             return int(cfg.audio_end_token_id)
 
-        masked = logits.clone()
         if bool(data.is_audio):
-            disallow = torch.ones(
-                masked.shape[-1],
-                dtype=torch.bool,
-                device=masked.device,
-            )
-            for token_id in (
-                int(cfg.audio_assistant_gen_slot_token_id),
-                int(cfg.audio_assistant_delay_slot_token_id),
-            ):
-                if 0 <= token_id < masked.shape[-1]:
-                    disallow[token_id] = False
-            masked[disallow] = float("-inf")
-        else:
-            for token_id in (
-                int(cfg.pad_token_id),
-                int(cfg.audio_assistant_gen_slot_token_id),
-                int(cfg.audio_assistant_delay_slot_token_id),
-                int(cfg.audio_end_token_id),
-            ):
-                if 0 <= token_id < masked.shape[-1]:
-                    masked[token_id] = float("-inf")
+            return self._sample_audio_mode_text_token(logits, data=data)
+
+        masked = logits.clone()
+        for token_id in (
+            int(cfg.pad_token_id),
+            int(cfg.audio_assistant_gen_slot_token_id),
+            int(cfg.audio_assistant_delay_slot_token_id),
+            int(cfg.audio_end_token_id),
+        ):
+            if 0 <= token_id < masked.shape[-1]:
+                masked[token_id] = float("-inf")
         if int(data.generation_steps) == 0:
             token_id = int(cfg.audio_assistant_delay_slot_token_id)
             if 0 <= token_id < masked.shape[-1]:
@@ -285,6 +287,53 @@ class MossTTSModelRunner(ModelRunner):
             ).item()
         )
 
+    def _sample_audio_mode_text_token(self, logits: torch.Tensor, *, data: Any) -> int:
+        # Upstream MossTTSDelay.generate() globally forbids delay-slot at
+        # time_step == 0, even when the prompt already ends in audio_start and
+        # is_audio is true. Missing this lets some requests immediately enter
+        # the flush path and creates the high-WER tail seen in full-set runs.
+        candidate_ids = self._audio_mode_text_token_ids(
+            logits,
+            include_delay=int(data.generation_steps) != 0,
+        )
+        if candidate_ids.numel() == 0:
+            return 0
+        if candidate_ids.numel() == 1:
+            return int(candidate_ids[0].item())
+        candidate_logits = torch.index_select(logits, 0, candidate_ids)
+        selected = self._sample_logits(
+            candidate_logits,
+            temperature=float(data.text_temperature),
+            top_p=float(data.text_top_p),
+            top_k=int(data.text_top_k),
+        )
+        return int(candidate_ids[selected].item())
+
+    def _audio_mode_text_token_ids(
+        self,
+        logits: torch.Tensor,
+        *,
+        include_delay: bool,
+    ) -> torch.Tensor:
+        device = logits.device
+        cache = getattr(self, "_audio_text_token_ids", None)
+        if cache is None:
+            cache = {}
+            self._audio_text_token_ids = cache
+        cached = cache.get((device, bool(include_delay)))
+        if cached is not None and cached.shape[0] > 0:
+            return cached
+
+        cfg = self.model.config
+        vocab_size = int(logits.shape[-1])
+        token_ids = [int(cfg.audio_assistant_gen_slot_token_id)]
+        if include_delay:
+            token_ids.append(int(cfg.audio_assistant_delay_slot_token_id))
+        valid = [token_id for token_id in token_ids if 0 <= token_id < vocab_size]
+        cached = torch.tensor(valid, dtype=torch.long, device=device)
+        cache[(device, bool(include_delay))] = cached
+        return cached
+
     @staticmethod
     def _delayed_length_value(delayed_length: int) -> int | None:
         delayed = int(delayed_length)
@@ -295,16 +344,13 @@ class MossTTSModelRunner(ModelRunner):
         data: Any,
         *,
         n_vq: int,
-        device: torch.device,
-    ) -> torch.Tensor:
+    ) -> list[bool]:
         delayed = MossTTSModelRunner._delayed_length_value(data.delayed_length)
-        indices = torch.arange(n_vq, dtype=torch.long, device=device)
-        pre_audio = int(data.audio_length) > indices
-        if delayed is None:
-            post_audio = torch.ones(n_vq, dtype=torch.bool, device=device)
-        else:
-            post_audio = indices > delayed - 1
-        return pre_audio & post_audio
+        audio_length = int(data.audio_length)
+        return [
+            audio_length > vq_idx and (delayed is None or vq_idx > delayed - 1)
+            for vq_idx in range(n_vq)
+        ]
 
     def _previous_audio_tokens(self, data: Any, vq_idx: int) -> torch.Tensor | None:
         parts = []
@@ -347,6 +393,7 @@ class MossTTSModelRunner(ModelRunner):
 
         if not torch.isfinite(scores).any():
             return torch.zeros((), dtype=torch.long, device=logits.device)
+
         if temperature <= 0:
             return torch.argmax(scores, dim=-1).to(dtype=torch.long)
 
@@ -362,9 +409,17 @@ class MossTTSModelRunner(ModelRunner):
             remove[0] = False
             scores[sorted_idx[remove]] = float("-inf")
         probs = torch.softmax(scores, dim=-1)
-        if not torch.isfinite(probs).all() or float(probs.sum().item()) <= 0.0:
-            return torch.argmax(logits, dim=-1).to(dtype=torch.long)
-        return torch.multinomial(probs, 1).squeeze(0).to(dtype=torch.long)
+        if not torch.isfinite(probs).all():
+            finite = torch.where(
+                torch.isfinite(scores),
+                scores,
+                torch.full_like(scores, float("-inf")),
+            )
+            return torch.argmax(finite, dim=-1).to(dtype=torch.long)
+        try:
+            return torch.multinomial(probs, 1).squeeze(0).to(dtype=torch.long)
+        except RuntimeError:
+            return torch.argmax(scores, dim=-1).to(dtype=torch.long)
 
     def _update_delay_state(self, data: Any, text_token: int, *, n_vq: int) -> None:
         cfg = self.model.config
@@ -411,7 +466,7 @@ class MossTTSModelRunner(ModelRunner):
             req_output = outputs[sched_req.request_id]
             if req_output.data is None or int(req_output.data) == eos_id:
                 continue
-            sched_req.data.output_rows.append(rows[row_idx].detach().cpu().clone())
+            sched_req.data.output_rows.append(rows[row_idx].detach().clone())
             sched_req.data.pending_feedback_queue.append(
                 embeds[row_idx].detach().clone()
             )

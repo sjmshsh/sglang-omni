@@ -4,9 +4,11 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import collections
 import hashlib
 import io
+import os
 import re
 import threading
 import time
@@ -156,10 +158,15 @@ def resolve_moss_reference(
     reference = references[0] if references else {}
     ref_audio = (
         reference.get("audio_path")
+        or reference.get("path")
         or reference.get("ref_audio")
         or reference.get("audio")
         or tts_params.get("ref_audio")
     )
+    if ref_audio is None and any(
+        key in reference for key in ("bytes", "base64", "data")
+    ):
+        ref_audio = reference
     ref_text = reference.get("text") or tts_params.get("ref_text")
     return ref_audio, str(ref_text) if ref_text is not None else None
 
@@ -297,27 +304,73 @@ def build_row_cache_key_ids(rows: torch.Tensor) -> list[int]:
     return key_ids
 
 
-def _reference_for_processor(processor: Any, ref_audio: Any | None) -> list[Any] | None:
-    if ref_audio is None:
-        return None
-    if not isinstance(ref_audio, str):
-        return [ref_audio]
-    match = _DATA_URI_RE.match(ref_audio)
-    if match is None:
-        return [ref_audio]
-
+def _decode_reference_audio_for_processor(
+    processor: Any,
+    raw_audio: bytes,
+) -> torch.Tensor:
     try:
         import soundfile as sf
     except ImportError as exc:
         raise RuntimeError(
-            "MOSS-TTS base64 reference audio requires soundfile to decode the data URI"
+            "MOSS-TTS base64 reference audio requires soundfile to decode audio bytes"
         ) from exc
 
-    raw = base64.b64decode(match.group("data"))
-    audio, sample_rate = sf.read(io.BytesIO(raw), dtype="float32", always_2d=True)
+    audio, sample_rate = sf.read(io.BytesIO(raw_audio), dtype="float32", always_2d=True)
     wav = torch.from_numpy(audio.T)
-    codes = processor.encode_audios_from_wav([wav], int(sample_rate))[0]
-    return [codes]
+    return processor.encode_audios_from_wav([wav], int(sample_rate))[0]
+
+
+def _decode_base64_audio_payload(value: str) -> bytes:
+    match = _DATA_URI_RE.match(value)
+    if match is not None:
+        value = match.group("data")
+    try:
+        return base64.b64decode(value, validate=True)
+    except binascii.Error:
+        return base64.b64decode(value, validate=False)
+
+
+def _looks_like_inline_audio(value: str) -> bool:
+    if _DATA_URI_RE.match(value) is not None:
+        return True
+    stripped = value.strip()
+    if len(stripped) < 64 or os.path.exists(stripped):
+        return False
+    if stripped.startswith(("http://", "https://")):
+        return False
+    return bool(re.fullmatch(r"[A-Za-z0-9+/=\s]+", stripped))
+
+
+def _reference_for_processor(processor: Any, ref_audio: Any | None) -> list[Any] | None:
+    if ref_audio is None:
+        return None
+    if isinstance(ref_audio, dict):
+        for key in ("audio_path", "path", "ref_audio", "audio"):
+            if ref_audio.get(key) is not None:
+                return _reference_for_processor(processor, ref_audio[key])
+        if ref_audio.get("bytes") is not None:
+            raw = ref_audio["bytes"]
+            if isinstance(raw, str):
+                raw = raw.encode("latin1")
+            return [_decode_reference_audio_for_processor(processor, bytes(raw))]
+        encoded = ref_audio.get("base64") or ref_audio.get("data")
+        if encoded is not None:
+            return [
+                _decode_reference_audio_for_processor(
+                    processor,
+                    _decode_base64_audio_payload(str(encoded)),
+                )
+            ]
+    if not isinstance(ref_audio, str):
+        return [ref_audio]
+    if not _looks_like_inline_audio(ref_audio):
+        return [ref_audio]
+    return [
+        _decode_reference_audio_for_processor(
+            processor,
+            _decode_base64_audio_payload(ref_audio.strip()),
+        )
+    ]
 
 
 def _build_processor_message(processor: Any, state: MossTTSState) -> dict[str, Any]:

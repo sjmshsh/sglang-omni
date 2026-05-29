@@ -532,8 +532,8 @@ rows:
     locate:
       section_substring: "Accuracy (accuracy.wer)"
       config_substring: "EN, stream=False"
-      source_workload: "router, 1-worker, full-set, c=16, no sampling"
-    client: "python -m benchmarks.eval.benchmark_tts_seedtts --model OpenMOSS-Team/MOSS-TTS-v1.5 --port {port} --meta zhaochenyang20/seed-tts-eval-arrow --max-concurrency 16 --lang en --output-dir {output_dir} --device {asr_gpu} --ref-format references --temperature 0 --top-p 1 --top-k -1 --repetition-penalty 1 --with-similarity"
+      source_workload: "router, 1-worker, full-set, c=16, upstream sampling defaults, token_count=auto"
+    client: "python -m benchmarks.eval.benchmark_tts_seedtts --model OpenMOSS-Team/MOSS-TTS-v1.5 --port {port} --meta zhaochenyang20/seed-tts-eval-arrow --max-concurrency 16 --lang en --output-dir {output_dir} --device {asr_gpu} --ref-format references --token-count auto --with-similarity"
     result_json: "wer_results.json"
     cells:
       wer_corpus:            { path: "summary.wer_corpus",            format: "{v:.2%}" }
@@ -549,8 +549,8 @@ rows:
     locate:
       section_substring: "Accuracy (accuracy.wer)"
       config_substring: "ZH, stream=False"
-      source_workload: "router, 1-worker, full-set, c=16, no sampling"
-    client: "python -m benchmarks.eval.benchmark_tts_seedtts --model OpenMOSS-Team/MOSS-TTS-v1.5 --port {port} --meta zhaochenyang20/seed-tts-eval-arrow --max-concurrency 16 --lang zh --output-dir {output_dir} --device {asr_gpu} --ref-format references --temperature 0 --top-p 1 --top-k -1 --repetition-penalty 1 --with-similarity"
+      source_workload: "router, 1-worker, full-set, c=16, upstream sampling defaults, token_count=auto"
+    client: "python -m benchmarks.eval.benchmark_tts_seedtts --model OpenMOSS-Team/MOSS-TTS-v1.5 --port {port} --meta zhaochenyang20/seed-tts-eval-arrow --max-concurrency 16 --lang zh --output-dir {output_dir} --device {asr_gpu} --ref-format references --token-count auto --with-similarity"
     result_json: "wer_results.json"
     cells:
       wer_corpus:            { path: "summary.wer_corpus",            format: "{v:.2%}" }
@@ -566,8 +566,8 @@ rows:
     locate:
       section_substring: "Speaker similarity (accuracy.similarity)"
       config_substring: "EN"
-      source_workload: "router, 1-worker, full-set, c=16, no sampling"
-    client: "python -m benchmarks.eval.benchmark_tts_seedtts --model OpenMOSS-Team/MOSS-TTS-v1.5 --port {port} --meta zhaochenyang20/seed-tts-eval-arrow --max-concurrency 16 --lang en --output-dir {output_dir} --device {asr_gpu} --ref-format references --temperature 0 --top-p 1 --top-k -1 --repetition-penalty 1 --with-similarity"
+      source_workload: "router, 1-worker, full-set, c=16, upstream sampling defaults, token_count=auto"
+    client: "python -m benchmarks.eval.benchmark_tts_seedtts --model OpenMOSS-Team/MOSS-TTS-v1.5 --port {port} --meta zhaochenyang20/seed-tts-eval-arrow --max-concurrency 16 --lang en --output-dir {output_dir} --device {asr_gpu} --ref-format references --token-count auto --with-similarity"
     result_json: "similarity_results.json"
     cells:
       speaker_similarity_mean: { path: "summary.speaker_similarity_mean", format: "{v:.2f}" }
@@ -580,8 +580,8 @@ rows:
     locate:
       section_substring: "Speaker similarity (accuracy.similarity)"
       config_substring: "ZH"
-      source_workload: "router, 1-worker, full-set, c=16, no sampling"
-    client: "python -m benchmarks.eval.benchmark_tts_seedtts --model OpenMOSS-Team/MOSS-TTS-v1.5 --port {port} --meta zhaochenyang20/seed-tts-eval-arrow --max-concurrency 16 --lang zh --output-dir {output_dir} --device {asr_gpu} --ref-format references --temperature 0 --top-p 1 --top-k -1 --repetition-penalty 1 --with-similarity"
+      source_workload: "router, 1-worker, full-set, c=16, upstream sampling defaults, token_count=auto"
+    client: "python -m benchmarks.eval.benchmark_tts_seedtts --model OpenMOSS-Team/MOSS-TTS-v1.5 --port {port} --meta zhaochenyang20/seed-tts-eval-arrow --max-concurrency 16 --lang zh --output-dir {output_dir} --device {asr_gpu} --ref-format references --token-count auto --with-similarity"
     result_json: "similarity_results.json"
     cells:
       speaker_similarity_mean: { path: "summary.speaker_similarity_mean", format: "{v:.2f}" }
@@ -594,8 +594,8 @@ rows:
     locate:
       section_substring: "Generation speed (generation.speed)"
       config_substring: "EN, stream=False"
-      source_workload: "router, 1-worker, full-set, c=16, no sampling"
-    client: "python -m benchmarks.eval.benchmark_tts_seedtts --generate-only --model OpenMOSS-Team/MOSS-TTS-v1.5 --port {port} --meta zhaochenyang20/seed-tts-eval-arrow --max-concurrency 16 --lang en --output-dir {output_dir} --ref-format references --temperature 0 --top-p 1 --top-k -1 --repetition-penalty 1"
+      source_workload: "router, 1-worker, full-set, c=16, upstream sampling defaults, token_count=auto"
+    client: "python -m benchmarks.eval.benchmark_tts_seedtts --generate-only --model OpenMOSS-Team/MOSS-TTS-v1.5 --port {port} --meta zhaochenyang20/seed-tts-eval-arrow --max-concurrency 16 --lang en --output-dir {output_dir} --ref-format references --token-count auto"
     result_json: "speed_results.json"
     cells:
       latency_mean_s: { path: "summary.latency_mean_s", format: "{v:.3f}" }
@@ -610,8 +610,8 @@ rows:
     locate:
       section_substring: "Generation speed (generation.speed)"
       config_substring: "ZH, stream=False"
-      source_workload: "router, 1-worker, full-set, c=16, no sampling"
-    client: "python -m benchmarks.eval.benchmark_tts_seedtts --generate-only --model OpenMOSS-Team/MOSS-TTS-v1.5 --port {port} --meta zhaochenyang20/seed-tts-eval-arrow --max-concurrency 16 --lang zh --output-dir {output_dir} --ref-format references --temperature 0 --top-p 1 --top-k -1 --repetition-penalty 1"
+      source_workload: "router, 1-worker, full-set, c=16, upstream sampling defaults, token_count=auto"
+    client: "python -m benchmarks.eval.benchmark_tts_seedtts --generate-only --model OpenMOSS-Team/MOSS-TTS-v1.5 --port {port} --meta zhaochenyang20/seed-tts-eval-arrow --max-concurrency 16 --lang zh --output-dir {output_dir} --ref-format references --token-count auto"
     result_json: "speed_results.json"
     cells:
       latency_mean_s: { path: "summary.latency_mean_s", format: "{v:.3f}" }

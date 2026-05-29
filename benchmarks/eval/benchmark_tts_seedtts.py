@@ -449,7 +449,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help=(
             "Reference payload shape for voice cloning. The default 'flat' sends "
             "ref_audio/ref_text, preserving the original behavior for S2-Pro "
-            "and similar models. Use 'references' for Higgs TTS."
+            "and similar models. Use 'references' for Higgs TTS and MOSS-TTS."
         ),
     )
     parser.add_argument("--output-dir", type=str, default="results/tts_seedtts")

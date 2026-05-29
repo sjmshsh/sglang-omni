@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import base64
 import sys
 import types
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
@@ -25,6 +27,7 @@ from sglang_omni.models.moss_tts.request_builders import (
     build_sglang_moss_tts_request,
     clear_moss_tts_preprocessing_context,
     preprocess_moss_tts_payload,
+    _reference_for_processor,
     set_moss_tts_preprocessing_context,
 )
 from sglang_omni.models.registry import PIPELINE_CONFIG_REGISTRY
@@ -354,6 +357,38 @@ def test_moss_delay_runner_samples_audio_and_appends_feedback() -> None:
     assert data.audio_length == 2
 
 
+def test_moss_audio_mode_first_step_disallows_delay_slot() -> None:
+    from sglang_omni.models.moss_tts.model_runner import MossTTSModelRunner
+
+    cfg = SimpleNamespace(
+        audio_assistant_gen_slot_token_id=12,
+        audio_assistant_delay_slot_token_id=13,
+    )
+    runner = MossTTSModelRunner.__new__(MossTTSModelRunner)
+    runner.model = SimpleNamespace(config=cfg)
+    runner._audio_text_token_ids = {}
+    data = SimpleNamespace(
+        generation_steps=0,
+        text_temperature=0.0,
+        text_top_p=1.0,
+        text_top_k=-1,
+    )
+    logits = torch.full((20,), -100.0)
+    logits[cfg.audio_assistant_gen_slot_token_id] = 1.0
+    logits[cfg.audio_assistant_delay_slot_token_id] = 10.0
+
+    assert (
+        runner._sample_audio_mode_text_token(logits, data=data)
+        == cfg.audio_assistant_gen_slot_token_id
+    )
+
+    data.generation_steps = 1
+    assert (
+        runner._sample_audio_mode_text_token(logits, data=data)
+        == cfg.audio_assistant_delay_slot_token_id
+    )
+
+
 def test_moss_decode_feedback_uses_row_id_embedding() -> None:
     from sglang_omni.models.moss_tts.model_runner import MossTTSModelRunner
 
@@ -380,6 +415,35 @@ def test_moss_decode_feedback_uses_row_id_embedding() -> None:
     assert torch.equal(embedding.weight[1].detach(), torch.full((3,), 2.0))
     assert requests[0].data.pending_feedback_queue == []
     assert requests[1].data.pending_feedback_queue == []
+
+
+def test_moss_decode_feedback_initializes_cuda_graph_padding_rows() -> None:
+    from sglang_omni.models.moss_tts.model_runner import MossTTSModelRunner
+
+    runner = MossTTSModelRunner.__new__(MossTTSModelRunner)
+    embedding = torch.nn.Embedding(4, 3)
+    runner.model = SimpleNamespace(
+        hidden_size=3,
+        _decode_input_embedding=embedding,
+    )
+    forward_batch = SimpleNamespace(
+        batch_size=4,
+        input_ids=torch.full((4,), 99, dtype=torch.long),
+    )
+    requests = [
+        SimpleNamespace(data=SimpleNamespace(pending_feedback_queue=[torch.ones(3)])),
+        SimpleNamespace(
+            data=SimpleNamespace(pending_feedback_queue=[torch.full((3,), 2.0)])
+        ),
+    ]
+
+    runner._write_decode_input_embedding(forward_batch, requests)
+
+    assert forward_batch.input_ids.tolist() == [0, 1, 2, 3]
+    assert torch.equal(embedding.weight[0].detach(), torch.ones(3))
+    assert torch.equal(embedding.weight[1].detach(), torch.full((3,), 2.0))
+    assert torch.equal(embedding.weight[2].detach(), torch.zeros(3))
+    assert torch.equal(embedding.weight[3].detach(), torch.zeros(3))
 
 
 def test_moss_channel_logits_fallback_uses_hidden_states() -> None:
@@ -551,3 +615,31 @@ def test_moss_delay_codec_splits_non_pad_segments() -> None:
     segments = split_moss_audio_segments(delayed, audio_pad_code=1024)
 
     assert [segment.tolist() for segment in segments] == [[[1, 3], [2, 4]]]
+
+
+def test_moss_reference_accepts_base64_dict(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_sf = types.ModuleType("soundfile")
+
+    def fake_read(file_obj, *, dtype, always_2d):
+        assert dtype == "float32"
+        assert always_2d is True
+        assert file_obj.read() == b"wav-bytes"
+        return np.zeros((4, 1), dtype=np.float32), 24000
+
+    fake_sf.read = fake_read
+    monkeypatch.setitem(sys.modules, "soundfile", fake_sf)
+
+    class FakeProcessor:
+        def encode_audios_from_wav(self, wavs, sample_rate):
+            assert sample_rate == 24000
+            assert wavs[0].shape == (1, 4)
+            return [torch.tensor([[1, 2]], dtype=torch.long)]
+
+    encoded = base64.b64encode(b"wav-bytes").decode("ascii")
+    references = _reference_for_processor(
+        FakeProcessor(),
+        {"base64": encoded, "media_type": "audio/wav"},
+    )
+
+    assert len(references) == 1
+    assert torch.equal(references[0], torch.tensor([[1, 2]], dtype=torch.long))
