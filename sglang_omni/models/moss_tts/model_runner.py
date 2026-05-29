@@ -123,10 +123,10 @@ class MossTTSModelRunner(ModelRunner):
         for sched_req in requests:
             queue = sched_req.data.pending_feedback_queue
             if not queue:
-                rows.append(
-                    torch.zeros(self.model.hidden_size, device=weight.device)
+                raise RuntimeError(
+                    "MOSS-TTS decode is missing feedback embedding for active "
+                    f"request {getattr(sched_req, 'request_id', '<unknown>')}"
                 )
-                continue
             if hasattr(queue, "popleft"):
                 rows.append(queue.popleft())
             else:
@@ -246,7 +246,6 @@ class MossTTSModelRunner(ModelRunner):
             )
 
         self._update_delay_state(data, int(text_token), n_vq=n_vq)
-        data.generation_steps = int(data.generation_steps) + 1
         return int(text_token), audio_tokens
 
     def _next_text_token(self, logits: torch.Tensor, *, data: Any, n_vq: int) -> int:

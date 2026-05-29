@@ -485,13 +485,23 @@ def _initialize_generation_state(
     cfg = model.config
     seq_len = int(prompt_rows.shape[0])
     last_text = int(prompt_rows[-1, 0].item())
+    delay_token_id = int(cfg.audio_assistant_delay_slot_token_id)
     is_continuation = last_text in (
         int(cfg.audio_start_token_id),
         int(cfg.audio_assistant_gen_slot_token_id),
+        delay_token_id,
     )
     audio_start_idx = _last_equal(prompt_rows, int(cfg.audio_start_token_id))
     data.is_audio = bool(is_continuation and audio_start_idx >= 0)
     data.audio_length = seq_len - audio_start_idx if data.is_audio else 0
+    data.delayed_length = _INF_DELAY
+    if data.is_audio and last_text == delay_token_id:
+        trailing_delay_steps = 0
+        for token in reversed(prompt_rows[:, 0].tolist()):
+            if int(token) != delay_token_id:
+                break
+            trailing_delay_steps += 1
+        data.delayed_length = trailing_delay_steps
     assistant_start_idx = _last_equal(prompt_rows, int(cfg.im_start_token_id)) + 3
     assistant_start_idx = max(0, min(assistant_start_idx, seq_len))
     data.assistant_prefix_rows = prompt_rows[assistant_start_idx:].detach().clone()

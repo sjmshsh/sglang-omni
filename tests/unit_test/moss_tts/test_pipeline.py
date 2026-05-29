@@ -22,6 +22,7 @@ from sglang_omni.models.moss_tts.config import MossTTSPipelineConfig
 from sglang_omni.models.moss_tts.payload_types import MossTTSState
 from sglang_omni.models.moss_tts.request_builders import (
     _INF_DELAY,
+    _initialize_generation_state,
     build_moss_tts_state,
     build_row_cache_key_ids,
     build_sglang_moss_tts_request,
@@ -287,6 +288,7 @@ def test_moss_preprocess_and_sglang_request_handoff(
             im_start_token_id=151644,
             audio_start_token_id=151652,
             audio_assistant_gen_slot_token_id=151656,
+            audio_assistant_delay_slot_token_id=151662,
         )
     )
 
@@ -305,6 +307,43 @@ def test_moss_preprocess_and_sglang_request_handoff(
     assert data.prompt_rows.shape == (3, 3)
     assert data.state.assistant_start_length == 0
     assert data.req.sampling_params.stop_token_ids == [151645]
+
+
+def test_moss_generation_state_recovers_trailing_delay_prompt() -> None:
+    cfg = SimpleNamespace(
+        im_start_token_id=20,
+        audio_start_token_id=10,
+        audio_assistant_gen_slot_token_id=12,
+        audio_assistant_delay_slot_token_id=13,
+    )
+    prompt_rows = torch.tensor(
+        [
+            [20, 1024, 1024],
+            [1, 1024, 1024],
+            [2, 1024, 1024],
+            [10, 1024, 1024],
+            [12, 7, 1024],
+            [12, 8, 9],
+            [13, 1024, 10],
+            [13, 1024, 1024],
+        ],
+        dtype=torch.long,
+    )
+    data = SimpleNamespace(
+        prompt_rows=prompt_rows,
+        is_audio=False,
+        audio_length=0,
+        delayed_length=_INF_DELAY,
+        assistant_prefix_rows=None,
+        state=MossTTSState(),
+    )
+
+    _initialize_generation_state(data, model=SimpleNamespace(config=cfg))
+
+    assert data.is_audio is True
+    assert data.audio_length == 5
+    assert data.delayed_length == 2
+    assert data.state.assistant_start_length == 5
 
 
 def test_moss_delay_runner_samples_audio_and_appends_feedback() -> None:
@@ -358,7 +397,12 @@ def test_moss_delay_runner_samples_audio_and_appends_feedback() -> None:
     assert audio_tokens.tolist() == [cfg.audio_pad_code, cfg.audio_pad_code]
     assert data.is_audio is True
     assert data.audio_length == 1
-    assert data.generation_steps == 1
+    assert data.generation_steps == 0
+
+    # The shared ModelRunner.execute() owns the per-request generation step
+    # increment after output processing. Simulate that outer tick here because
+    # this test calls the MOSS row sampler directly.
+    data.generation_steps += 1
 
     text_logits[0] = -100.0
     text_logits[0, cfg.audio_assistant_gen_slot_token_id] = 10.0
@@ -372,7 +416,7 @@ def test_moss_delay_runner_samples_audio_and_appends_feedback() -> None:
     assert text_token == cfg.audio_assistant_gen_slot_token_id
     assert audio_tokens.tolist() == [2, cfg.audio_pad_code]
     assert data.audio_length == 2
-    assert data.generation_steps == 2
+    assert data.generation_steps == 1
 
 
 def test_moss_audio_mode_first_step_disallows_delay_slot() -> None:
@@ -462,6 +506,27 @@ def test_moss_decode_feedback_initializes_cuda_graph_padding_rows() -> None:
     assert torch.equal(embedding.weight[1].detach(), torch.full((3,), 2.0))
     assert torch.equal(embedding.weight[2].detach(), torch.zeros(3))
     assert torch.equal(embedding.weight[3].detach(), torch.zeros(3))
+
+
+def test_moss_decode_feedback_requires_active_request_embedding() -> None:
+    from sglang_omni.models.moss_tts.model_runner import MossTTSModelRunner
+
+    runner = MossTTSModelRunner.__new__(MossTTSModelRunner)
+    embedding = torch.nn.Embedding(4, 3)
+    runner.model = SimpleNamespace(
+        hidden_size=3,
+        _decode_input_embedding=embedding,
+    )
+    forward_batch = SimpleNamespace(input_ids=torch.full((1,), 99, dtype=torch.long))
+    requests = [
+        SimpleNamespace(
+            request_id="req-empty",
+            data=SimpleNamespace(pending_feedback_queue=[]),
+        )
+    ]
+
+    with pytest.raises(RuntimeError, match="missing feedback embedding"):
+        runner._write_decode_input_embedding(forward_batch, requests)
 
 
 def test_moss_channel_logits_fallback_uses_hidden_states() -> None:
@@ -584,6 +649,34 @@ def test_moss_channel_logits_use_decode_metadata(
     assert processor.seen_metadata is metadata
     assert metadata.forward_mode is ForwardMode.DECODE
     assert metadata.next_token_logits_buffer is None
+
+
+def test_moss_logits_processors_use_channel_vocab_sizes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from sglang_omni.models.moss_tts import sglang_model
+    from sglang_omni.models.moss_tts.sglang_model import MossTTSDelaySGLangModel
+
+    seen_vocab_sizes = []
+
+    class FakeLogitsProcessor:
+        def __init__(self, config) -> None:
+            seen_vocab_sizes.append(int(config.vocab_size))
+
+    monkeypatch.setattr(sglang_model, "LogitsProcessor", FakeLogitsProcessor)
+    config = SimpleNamespace(
+        vocab_size=151936,
+        vocab_size_list=[151936, 1025, 1025],
+    )
+
+    processors = [
+        MossTTSDelaySGLangModel._make_logits_processor(config, idx)
+        for idx in range(len(config.vocab_size_list))
+    ]
+
+    assert len(processors) == 3
+    assert seen_vocab_sizes == [151936, 1025, 1025]
+    assert config.vocab_size == 151936
 
 
 def test_moss_post_process_outputs_skips_im_end() -> None:

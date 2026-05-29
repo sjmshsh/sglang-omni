@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+from copy import copy
 from typing import Any, Iterable, Optional, Tuple
 
 import torch
@@ -111,7 +112,10 @@ class MossTTSDelaySGLangModel(torch.nn.Module):
                 self.lm_heads.append(PPMissingLayer())
 
         self.logits_processors = torch.nn.ModuleList(
-            [LogitsProcessor(self.config) for _ in range(self.config.channels)]
+            [
+                self._make_logits_processor(self.config, idx)
+                for idx in range(self.config.channels)
+            ]
         )
         self._pad_token_per_channel = self._compute_pad_token_per_channel()
 
@@ -168,6 +172,12 @@ class MossTTSDelaySGLangModel(torch.nn.Module):
         config.language_config.vocab_size_list = list(config.vocab_size_list)
         config.language_config.pad_token = list(config.pad_token)
         return config
+
+    @staticmethod
+    def _make_logits_processor(config: Any, channel: int) -> LogitsProcessor:
+        channel_config = copy(config)
+        channel_config.vocab_size = int(config.vocab_size_list[channel])
+        return LogitsProcessor(channel_config)
 
     def _first_embedding_weight(self) -> torch.Tensor:
         for layer in self.embedding_list:
