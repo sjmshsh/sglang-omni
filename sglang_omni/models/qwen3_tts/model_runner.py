@@ -39,7 +39,10 @@ class Qwen3TTSModelRunner(ModelRunner):
         forward_batch: Any,
         schedule_batch: Any,
         requests: list,
+        *,
+        is_lookahead: bool = False,
     ) -> GenerationBatchResult | None:
+        del is_lookahead
         del schedule_batch
         self.model.prepare_decode_buffers(requests)
         self._write_feedback_buffers(forward_batch, requests)

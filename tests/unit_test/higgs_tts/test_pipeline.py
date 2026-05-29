@@ -124,7 +124,7 @@ def test_higgs_model_runner_marks_sampler_finish_cg() -> None:
             last_codes=torch.zeros((1, 3), dtype=torch.long),
         ),
     )
-    req = SimpleNamespace(is_chunked=0, finished_reason=None)
+    req = SimpleNamespace(is_chunked=0, finished_reason=None, finished=lambda: False)
     data = SimpleNamespace(req=req, output_codes=[], generation_done=False)
     result = SimpleNamespace(
         logits_output=SimpleNamespace(next_token_logits=torch.zeros(1, 4))
@@ -168,10 +168,10 @@ def test_higgs_model_runner_collect_cg_mixed_batch() -> None:
     )
     # row0 chunked, row1 was-done, row2 active (not done), row3 active (EOC done).
     reqs = [
-        SimpleNamespace(is_chunked=1, finished_reason=None),
-        SimpleNamespace(is_chunked=0, finished_reason=None),
-        SimpleNamespace(is_chunked=0, finished_reason=None),
-        SimpleNamespace(is_chunked=0, finished_reason=None),
+        SimpleNamespace(is_chunked=1, finished_reason=None, finished=lambda: False),
+        SimpleNamespace(is_chunked=0, finished_reason=None, finished=lambda: False),
+        SimpleNamespace(is_chunked=0, finished_reason=None, finished=lambda: False),
+        SimpleNamespace(is_chunked=0, finished_reason=None, finished=lambda: False),
     ]
     datas = [
         SimpleNamespace(req=r, output_codes=[], generation_done=False) for r in reqs

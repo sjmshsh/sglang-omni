@@ -234,6 +234,8 @@ def create_sglang_tts_engine_executor(
     device: str = "cuda:0",
     max_new_tokens: int | None = 2048,
     server_args_overrides: dict[str, Any] | None = None,
+    enable_async_decode: bool = False,
+    async_decode_min_batch_size: int = 2,
 ):
     """sglang-backed AR engine for Higgs TTS."""
     checkpoint_dir = resolve_checkpoint(model_path)
@@ -297,6 +299,8 @@ def create_sglang_tts_engine_executor(
         request_builder=request_builder,
         result_adapter=result_adapter,
         abort_callback=model.reset_request,
+        enable_async_decode=enable_async_decode,
+        async_decode_min_batch_size=async_decode_min_batch_size,
     )
 
 

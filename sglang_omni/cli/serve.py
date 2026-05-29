@@ -14,6 +14,9 @@ logger = logging.getLogger(__name__)
 
 _STAGE_TOGGLE_MODE = Literal["default", "on", "off"]
 _QWEN_COLOCATED_CONFIG_CLASS = "Qwen3OmniSpeechColocatedPipelineConfig"
+_HIGGS_ASYNC_DECODE_FACTORY = (
+    "sglang_omni.models.higgs_tts.stages.create_sglang_tts_engine_executor"
+)
 
 
 def launch_server(*args: object, **kwargs: object) -> object:
@@ -624,6 +627,62 @@ def apply_cuda_graph_cli_overrides(
     return pipeline_config
 
 
+def _apply_stage_factory_args_override(
+    pipeline_config: PipelineConfig,
+    *,
+    stage_name: str,
+    updates: dict[str, object],
+    reason: str,
+    supported_factory: str | None = None,
+    flag_name: str | None = None,
+) -> None:
+    matching_stages = _find_matching_stages(
+        pipeline_config,
+        stage_name=stage_name,
+        reason=reason,
+    )
+    for stage in matching_stages:
+        if supported_factory is not None and stage.factory != supported_factory:
+            display_flag = flag_name or reason
+            raise typer.BadParameter(
+                f"{display_flag} currently supports only Higgs TTS; "
+                f"stage {stage.name!r} uses factory {stage.factory!r}"
+            )
+        factory_args = dict(stage.factory_args or {})
+        factory_args.update(updates)
+        stage.factory_args = factory_args
+
+        stage_runtime_overrides = pipeline_config.runtime_overrides.get(stage.name)
+        if isinstance(stage_runtime_overrides, dict):
+            stage_runtime_overrides.update(updates)
+
+
+def apply_async_decode_cli_overrides(
+    pipeline_config: PipelineConfig,
+    *,
+    enable_async_decode: bool,
+    async_decode_min_batch_size: int | None,
+) -> PipelineConfig:
+    updates: dict[str, object] = {}
+    if enable_async_decode:
+        updates["enable_async_decode"] = True
+    if async_decode_min_batch_size is not None:
+        if int(async_decode_min_batch_size) < 1:
+            raise typer.BadParameter("--async-decode-min-batch-size must be >= 1")
+        updates["async_decode_min_batch_size"] = int(async_decode_min_batch_size)
+    if not updates:
+        return pipeline_config
+    _apply_stage_factory_args_override(
+        pipeline_config,
+        stage_name="tts_engine",
+        updates=updates,
+        reason="async decode override",
+        supported_factory=_HIGGS_ASYNC_DECODE_FACTORY,
+        flag_name="--enable-async-decode/--async-decode-min-batch-size",
+    )
+    return pipeline_config
+
+
 def apply_torch_compile_cli_overrides(
     pipeline_config: PipelineConfig,
     *,
@@ -850,6 +909,29 @@ def serve(
             help="Mount the OpenAI Realtime WebSocket endpoint at /v1/realtime.",
         ),
     ] = False,
+    enable_async_decode: Annotated[
+        bool,
+        typer.Option(
+            "--enable-async-decode",
+            "--enable_async_decode",
+            help=(
+                "Enable one-step-lookahead async decode for the tts_engine stage "
+                "(overlaps per-step host collect with the next GPU forward). "
+                "Currently supported by Higgs TTS."
+            ),
+        ),
+    ] = False,
+    async_decode_min_batch_size: Annotated[
+        int | None,
+        typer.Option(
+            "--async-decode-min-batch-size",
+            "--async_decode_min_batch_size",
+            help=(
+                "Decode batches smaller than this bypass the async-decode "
+                "lookahead and run synchronously (fast path). Default 2."
+            ),
+        ),
+    ] = None,
 ) -> None:
     """Serve the pipeline."""
     logging.basicConfig(
@@ -918,6 +1000,11 @@ def serve(
         talker_torch_compile=talker_torch_compile,
         thinker_torch_compile_max_bs=thinker_torch_compile_max_bs,
         talker_torch_compile_max_bs=talker_torch_compile_max_bs,
+    )
+    merged_config = apply_async_decode_cli_overrides(
+        merged_config,
+        enable_async_decode=enable_async_decode,
+        async_decode_min_batch_size=async_decode_min_batch_size,
     )
 
     if _should_print_merged_config(colocate=colocate, log_level=log_level):

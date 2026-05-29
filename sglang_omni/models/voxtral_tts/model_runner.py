@@ -36,7 +36,10 @@ class VoxtralTTSModelRunner(ModelRunner):
         forward_batch: Any,
         schedule_batch: Any,
         requests: list,
+        *,
+        is_lookahead: bool = False,
     ) -> GenerationBatchResult | None:
+        del is_lookahead
         del forward_batch, schedule_batch
         self._write_decode_input_embed_buffer(requests)
         return None
