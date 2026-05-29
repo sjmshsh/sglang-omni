@@ -42,6 +42,43 @@ _GENERATION_FIELDS = (
     "audio_repetition_penalty",
 )
 
+_MOSS_TTS_LANGUAGE_TAGS = {
+    "ar": "Arabic",
+    "cs": "Czech",
+    "da": "Danish",
+    "de": "German",
+    "el": "Greek",
+    "en": "English",
+    "english": "English",
+    "es": "Spanish",
+    "fa": "Persian (Farsi)",
+    "fi": "Finnish",
+    "fr": "French",
+    "he": "Hebrew",
+    "hi": "Hindi",
+    "hu": "Hungarian",
+    "it": "Italian",
+    "ja": "Japanese",
+    "ko": "Korean",
+    "mk": "Macedonian",
+    "ms": "Malay",
+    "nl": "Dutch",
+    "pl": "Polish",
+    "pt": "Portuguese",
+    "ro": "Romanian",
+    "ru": "Russian",
+    "sv": "Swedish",
+    "sw": "Swahili",
+    "th": "Thai",
+    "tl": "Tagalog",
+    "tr": "Turkish",
+    "vi": "Vietnamese",
+    "yue": "Cantonese",
+    "zh": "Chinese",
+    "zh-cn": "Chinese",
+    "chinese": "Chinese",
+}
+
 
 @dataclass
 class MossTTSSGLangRequestData(ARRequestData):
@@ -178,6 +215,14 @@ def _resolve_optional_text(value: Any) -> str | None:
     return text or None
 
 
+def _normalize_language_tag(value: str | None) -> str | None:
+    """Use the language labels preferred by upstream MOSS-TTS-v1.5 prompts."""
+
+    if value is None:
+        return None
+    return _MOSS_TTS_LANGUAGE_TAGS.get(value.strip().lower(), value)
+
+
 def _resolve_token_count(
     text: str,
     params: dict[str, Any],
@@ -207,8 +252,8 @@ def build_moss_tts_state(payload: StagePayload) -> MossTTSState:
 
     text, references = normalize_moss_tts_inputs(inputs)
     ref_audio, ref_text = resolve_moss_reference(references, tts_params)
-    language = _resolve_optional_text(
-        tts_params.get("language") or params.get("language")
+    language = _normalize_language_tag(
+        _resolve_optional_text(tts_params.get("language") or params.get("language"))
     )
     instructions = _resolve_optional_text(
         tts_params.get("instructions")

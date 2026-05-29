@@ -173,7 +173,7 @@ def test_moss_tts_maps_references_token_count_and_deterministic_defaults() -> No
     assert state.text.startswith("${token:120}hello")
     assert state.ref_audio == "voice.wav"
     assert state.ref_text == "reference"
-    assert state.language == "en"
+    assert state.language == "English"
     assert state.token_count == 120
     assert state.generation_kwargs["max_new_tokens"] == 4096
     # Defaults follow the upstream checkpoint's generate() (sampling), not greedy.
@@ -216,6 +216,14 @@ def test_moss_tts_benchmark_payload_forwards_language() -> None:
     )
 
     assert payload["language"] == "en"
+
+
+def test_moss_tts_maps_language_codes_to_upstream_labels() -> None:
+    en_payload = make_payload(inputs="hello", tts_params={"language": "en"})
+    zh_payload = make_payload(inputs="你好", tts_params={"language": "zh"})
+
+    assert build_moss_tts_state(en_payload).language == "English"
+    assert build_moss_tts_state(zh_payload).language == "Chinese"
 
 
 def test_moss_tts_preserves_explicit_standard_sampling_values() -> None:
@@ -300,7 +308,7 @@ def test_moss_preprocess_and_sglang_request_handoff(
         clear_moss_tts_preprocessing_context()
 
     assert processor.message_kwargs["tokens"] == 80
-    assert processor.message_kwargs["language"] == "en"
+    assert processor.message_kwargs["language"] == "English"
     assert data.req._input_embeds_are_projected is True
     assert data.input_embeds_are_projected is True
     assert data.max_new_tokens == 12
