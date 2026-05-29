@@ -635,7 +635,7 @@ def test_moss_delay_codec_splits_non_pad_segments() -> None:
     assert [segment.tolist() for segment in segments] == [[[1, 3], [2, 4]]]
 
 
-def test_moss_delay_codec_keeps_partial_boundary_frames() -> None:
+def test_moss_delay_codec_drops_partial_boundary_frames_before_decode() -> None:
     delayed = torch.tensor(
         [
             [1024, 1024],
@@ -646,7 +646,7 @@ def test_moss_delay_codec_keeps_partial_boundary_frames() -> None:
 
     segments = split_moss_audio_segments(delayed, audio_pad_code=1024)
 
-    assert [segment.tolist() for segment in segments] == [[[1024, 2]]]
+    assert segments == []
 
 
 def test_moss_reference_accepts_base64_dict(monkeypatch: pytest.MonkeyPatch) -> None:

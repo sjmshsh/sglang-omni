@@ -51,7 +51,8 @@ def split_moss_audio_segments(
 
     pad_code = int(audio_pad_code)
     is_pad = (audio_codes == pad_code).all(dim=1)
-    non_pad = ~is_pad
+    is_valid_code = ((audio_codes >= 0) & (audio_codes < pad_code)).all(dim=1)
+    non_pad = (~is_pad) & is_valid_code
     if not bool(non_pad.any()):
         return []
 
