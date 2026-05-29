@@ -670,6 +670,8 @@ def build_speech_generate_request(
             tts_params[field] = value
     if req.ref_audio is not None:
         tts_params["ref_audio"] = req.ref_audio
+    if req.audio_data is not None:
+        tts_params["audio_data"] = req.audio_data
     if req.ref_text is not None:
         tts_params["ref_text"] = req.ref_text
     if req.seed is not None:
@@ -703,6 +705,11 @@ def build_speech_generate_request(
     # Backward compatibility with ref_audio/ref_text form.
     if req.ref_audio is not None:
         ref: dict[str, Any] = {"audio_path": req.ref_audio}
+        if req.ref_text is not None:
+            ref["text"] = req.ref_text
+        references.append(ref)
+    if req.audio_data is not None:
+        ref = {"audio_data": req.audio_data}
         if req.ref_text is not None:
             ref["text"] = req.ref_text
         references.append(ref)

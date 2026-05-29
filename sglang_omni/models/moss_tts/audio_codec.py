@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import os
 from pathlib import Path
 from typing import Any
@@ -65,12 +67,23 @@ def load_audio_to_24k(source: Any) -> tuple[torch.Tensor, int]:
     io = AudioMediaIO(target_sr=24000)
 
     def _load_path_or_url(src: str | Path) -> tuple[torch.Tensor, int]:
-        if isinstance(src, str) and _is_url(src):
-            response = global_http_connection.get_sync_client().get(src)
-            response.raise_for_status()
-            audio, sr = io.load_bytes(response.content)
-        else:
+        if isinstance(src, str):
+            audio_from_data = _load_base64_string(io, src)
+            if audio_from_data is not None:
+                return audio_from_data
+            if _is_url(src):
+                response = global_http_connection.get_sync_client().get(src)
+                response.raise_for_status()
+                audio, sr = io.load_bytes(response.content)
+                wav = torch.from_numpy(np.asarray(audio, dtype=np.float32)).reshape(-1)
+                return wav, int(sr)
+
+        if _path_exists(src):
             audio, sr = io.load_file(Path(src))
+        else:
+            raise FileNotFoundError(
+                f"Audio reference is not a URL, data URI/base64 audio, or file: {src}"
+            )
         wav = torch.from_numpy(np.asarray(audio, dtype=np.float32)).reshape(-1)
         return wav, int(sr)
 
@@ -82,26 +95,74 @@ def load_audio_to_24k(source: Any) -> tuple[torch.Tensor, int]:
     nested = source.get("audio")
     if nested is not None and nested is not source:
         return load_audio_to_24k(nested)
-    if "audio_path" in source or "path" in source or "ref_audio" in source:
-        return _load_path_or_url(
-            source.get("audio_path") or source.get("path") or source["ref_audio"]
-        )
-    if "bytes" in source:
+    path_source = (
+        source.get("audio_path")
+        or source.get("path")
+        or source.get("ref_audio")
+    )
+    if path_source is not None:
+        return _load_path_or_url(path_source)
+    if source.get("audio_data") is not None:
+        return _load_path_or_url(source["audio_data"])
+    if source.get("bytes") is not None:
         raw = source["bytes"]
         if isinstance(raw, str):
-            import base64
-
-            raw = base64.b64decode(raw)
+            raw = _decode_base64_payload(raw)
         audio, sr = io.load_bytes(raw)
         wav = torch.from_numpy(np.asarray(audio, dtype=np.float32)).reshape(-1)
         return wav, int(sr)
     data = source.get("base64") or source.get("data")
     if data is None:
         raise ValueError(
-            "audio reference dict must include path, bytes, base64, or data"
+            "audio reference dict must include path, bytes, base64, data, or audio_data"
         )
-    audio, sr = io.load_base64(source.get("media_type", "audio/wav"), data)
-    return torch.from_numpy(np.asarray(audio, dtype=np.float32)).reshape(-1), int(sr)
+    if not isinstance(data, str):
+        raise TypeError("base64/data audio references must be strings")
+    audio_from_data = _load_base64_string(io, data)
+    if audio_from_data is None:
+        raise ValueError("audio reference base64/data field is not valid audio data")
+    return audio_from_data
+
+
+def _path_exists(src: str | Path) -> bool:
+    try:
+        return Path(src).is_file()
+    except (OSError, TypeError):
+        return False
+
+
+def _decode_base64_payload(data: str) -> bytes:
+    payload = data.strip()
+    if payload.startswith("data:"):
+        _header, sep, body = payload.partition(",")
+        if not sep:
+            raise ValueError("Invalid data URI audio reference")
+        payload = body
+    return base64.b64decode(payload, validate=True)
+
+
+def _load_base64_string(
+    io: AudioMediaIO,
+    data: str,
+) -> tuple[torch.Tensor, int] | None:
+    text = data.strip()
+    if not text:
+        return None
+    if text.startswith("data:"):
+        _header, sep, body = text.partition(",")
+        if not sep:
+            return None
+        text = body
+    try:
+        raw = base64.b64decode(text, validate=True)
+    except (binascii.Error, ValueError):
+        return None
+    try:
+        audio, sr = io.load_bytes(raw)
+    except Exception:
+        return None
+    wav = torch.from_numpy(np.asarray(audio, dtype=np.float32)).reshape(-1)
+    return wav, int(sr)
 
 
 class MossAudioTokenizerCodec:

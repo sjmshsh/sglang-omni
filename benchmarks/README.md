@@ -153,7 +153,8 @@ to avoid GPU contention with the server. Use `--generate-only` or
 `--max-concurrency` are equivalent (see `benchmark_tts_seedtts.py`).
 `benchmark_tts_seedtts.py` also handles model-specific voice-cloning reference
 payloads: the default `--ref-format flat` sends `ref_audio`/`ref_text`, while
-`--ref-format references` sends `references=[{audio_path, text}]` for Higgs TTS.
+`--ref-format references` sends `references=[{audio_path, text}]` for Higgs TTS
+and MOSS-TTS.
 `benchmark_omni_seedtts.py` documents local vs CI GPU usage in its module
 docstring (sequential phases on CI to reduce OOM risk).
 

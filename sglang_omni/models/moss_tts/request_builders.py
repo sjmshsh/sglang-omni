@@ -150,12 +150,18 @@ def build_moss_tts_state(payload: StagePayload) -> MossTTSState:
     reference_audio = (
         inputs.get("reference_audio")
         or inputs.get("ref_audio")
+        or inputs.get("audio_data")
         or inputs.get("audio")
+        or tts_params.get("audio_data")
         or tts_params.get("ref_audio")
+        or first_ref.get("audio_data")
         or first_ref.get("audio_path")
         or first_ref.get("path")
         or first_ref.get("ref_audio")
         or first_ref.get("audio")
+        or first_ref.get("base64")
+        or first_ref.get("data")
+        or first_ref.get("bytes")
     )
     reference_text = (
         inputs.get("reference_text")

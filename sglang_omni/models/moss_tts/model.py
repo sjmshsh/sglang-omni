@@ -115,6 +115,9 @@ class MossTTSDelayModel(nn.Module):
             torch.empty(0, config.channels, dtype=torch.long),
             persistent=False,
         )
+        self._decode_input_capacity = self._infer_decode_input_capacity()
+        self._decode_input_batch_size = 0
+        self._decode_input_staged = False
 
     @staticmethod
     def _make_logits_processor(
@@ -150,6 +153,25 @@ class MossTTSDelayModel(nn.Module):
     def get_input_embeddings(self):
         return self.model.embed_tokens
 
+    @staticmethod
+    def _infer_decode_input_capacity() -> int:
+        try:
+            from sglang.srt.server_args import get_global_server_args
+
+            server_args = get_global_server_args()
+        except Exception:
+            server_args = None
+        if server_args is None:
+            return 16
+        graph_bs = getattr(server_args, "cuda_graph_bs", None) or []
+        graph_bs_max = max([int(x) for x in graph_bs], default=0)
+        return max(
+            16,
+            graph_bs_max,
+            int(getattr(server_args, "cuda_graph_max_bs", 0) or 0),
+            int(getattr(server_args, "max_running_requests", 0) or 0),
+        )
+
     def prepare_decode_inputs(self, input_ids_BC: torch.Tensor) -> None:
         """Stage multi-channel decode rows in a stable buffer for CUDA Graph."""
 
@@ -160,7 +182,11 @@ class MossTTSDelayModel(nn.Module):
             )
         batch_size = int(input_ids_BC.shape[0])
         if self._decode_input_ids.shape[0] < batch_size:
-            new_size = max(batch_size, max(16, self._decode_input_ids.shape[0] * 2))
+            new_size = max(
+                batch_size,
+                int(self._decode_input_capacity),
+                max(16, self._decode_input_ids.shape[0] * 2),
+            )
             self._decode_input_ids = torch.empty(
                 new_size,
                 self.config.channels,
@@ -168,6 +194,8 @@ class MossTTSDelayModel(nn.Module):
                 device=input_ids_BC.device,
             )
         self._decode_input_ids[:batch_size].copy_(input_ids_BC)
+        self._decode_input_batch_size = batch_size
+        self._decode_input_staged = True
 
     def _coerce_channel_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         if input_ids.ndim == 2:
@@ -219,9 +247,13 @@ class MossTTSDelayModel(nn.Module):
                 raise ValueError("MOSS-TTS forward requires input_ids or input_embeds")
             is_decode = bool(getattr(forward_batch.forward_mode, "is_decode")())
             if is_decode:
-                if self._decode_input_ids.shape[0] < input_ids.shape[0]:
+                batch_size = int(input_ids.shape[0])
+                if (
+                    not self._decode_input_staged
+                    or self._decode_input_batch_size != batch_size
+                ):
                     rows = torch.empty(
-                        input_ids.shape[0],
+                        batch_size,
                         self.config.channels,
                         device=input_ids.device,
                         dtype=torch.long,
@@ -231,8 +263,9 @@ class MossTTSDelayModel(nn.Module):
                     rows[:, 0] = input_ids
                     self.prepare_decode_inputs(rows)
                 input_embeds = self._prepare_multi_modal_inputs(
-                    self._decode_input_ids[: input_ids.shape[0]]
+                    self._decode_input_ids[:batch_size]
                 )
+                self._decode_input_staged = False
             elif self.pp_group.is_first_rank:
                 input_embeds = self._prepare_multi_modal_inputs(input_ids)
             else:
