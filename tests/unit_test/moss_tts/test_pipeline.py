@@ -200,6 +200,23 @@ def test_moss_tts_benchmark_auto_token_count_uses_openmoss_estimate() -> None:
     assert payload["token_count"] == 32
 
 
+def test_moss_tts_benchmark_payload_forwards_language() -> None:
+    sample = SampleInput(
+        sample_id="sample-1",
+        ref_text="reference",
+        ref_audio="ref.wav",
+        target_text="hello world",
+    )
+
+    payload = _build_tts_payload(
+        sample,
+        "OpenMOSS-Team/MOSS-TTS-v1.5",
+        language="en",
+    )
+
+    assert payload["language"] == "en"
+
+
 def test_moss_tts_preserves_explicit_standard_sampling_values() -> None:
     payload = make_payload(
         inputs="hello",
@@ -341,8 +358,8 @@ def test_moss_delay_runner_samples_audio_and_appends_feedback() -> None:
     assert audio_tokens.tolist() == [cfg.audio_pad_code, cfg.audio_pad_code]
     assert data.is_audio is True
     assert data.audio_length == 1
+    assert data.generation_steps == 1
 
-    data.generation_steps = 1
     text_logits[0] = -100.0
     text_logits[0, cfg.audio_assistant_gen_slot_token_id] = 10.0
     text_token, audio_tokens = runner._sample_next_row(
@@ -355,6 +372,7 @@ def test_moss_delay_runner_samples_audio_and_appends_feedback() -> None:
     assert text_token == cfg.audio_assistant_gen_slot_token_id
     assert audio_tokens.tolist() == [2, cfg.audio_pad_code]
     assert data.audio_length == 2
+    assert data.generation_steps == 2
 
 
 def test_moss_audio_mode_first_step_disallows_delay_slot() -> None:
@@ -615,6 +633,20 @@ def test_moss_delay_codec_splits_non_pad_segments() -> None:
     segments = split_moss_audio_segments(delayed, audio_pad_code=1024)
 
     assert [segment.tolist() for segment in segments] == [[[1, 3], [2, 4]]]
+
+
+def test_moss_delay_codec_keeps_partial_boundary_frames() -> None:
+    delayed = torch.tensor(
+        [
+            [1024, 1024],
+            [1, 2],
+        ],
+        dtype=torch.long,
+    )
+
+    segments = split_moss_audio_segments(delayed, audio_pad_code=1024)
+
+    assert [segment.tolist() for segment in segments] == [[[1024, 2]]]
 
 
 def test_moss_reference_accepts_base64_dict(monkeypatch: pytest.MonkeyPatch) -> None:

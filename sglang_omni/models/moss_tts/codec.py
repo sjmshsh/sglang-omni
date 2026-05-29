@@ -36,6 +36,7 @@ def split_moss_audio_segments(
 ) -> list[torch.Tensor]:
     """Extract contiguous decoded audio-code segments from delayed rows."""
 
+    del assistant_start_length
     if delayed_audio_codes is None:
         return []
     if not isinstance(delayed_audio_codes, torch.Tensor):
@@ -50,8 +51,7 @@ def split_moss_audio_segments(
 
     pad_code = int(audio_pad_code)
     is_pad = (audio_codes == pad_code).all(dim=1)
-    is_complete_code = ((audio_codes >= 0) & (audio_codes < pad_code)).all(dim=1)
-    non_pad = (~is_pad) & is_complete_code
+    non_pad = ~is_pad
     if not bool(non_pad.any()):
         return []
 
@@ -62,9 +62,4 @@ def split_moss_audio_segments(
     else:
         segments = list(torch.tensor_split(idx, break_points.cpu().tolist()))
 
-    code_segments = [audio_codes[segment].contiguous() for segment in segments]
-    if assistant_start_length > 0 and code_segments:
-        trim = min(int(assistant_start_length), int(code_segments[0].shape[0]))
-        code_segments[0] = code_segments[0][trim:]
-        code_segments = [segment for segment in code_segments if segment.numel() > 0]
-    return code_segments
+    return [audio_codes[segment].contiguous() for segment in segments]

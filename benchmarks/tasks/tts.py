@@ -1039,6 +1039,7 @@ def _build_tts_payload(
     ref_format: str = "flat",
     voice: str | None = None,
     task_type: str | None = None,
+    language: str | None = None,
     instructions: str | None = None,
     **gen_kwargs,
 ) -> dict:
@@ -1059,6 +1060,8 @@ def _build_tts_payload(
         payload["voice"] = voice
     if task_type is not None:
         payload["task_type"] = task_type
+    if language is not None:
+        payload["language"] = language
     if instructions is not None:
         payload["instructions"] = instructions
     resolved_gen_kwargs = _resolve_tts_generation_kwargs(sample, gen_kwargs)
@@ -1291,6 +1294,7 @@ def make_tts_send_fn(
     ref_format: str = "flat",
     voice: str | None = None,
     task_type: str | None = None,
+    language: str | None = None,
     instructions: str | None = None,
     save_audio_dir: str | None = None,
     **gen_kwargs,
@@ -1312,6 +1316,7 @@ def make_tts_send_fn(
             ref_format=ref_format,
             voice=voice,
             task_type=task_type,
+            language=language,
             instructions=instructions,
             **gen_kwargs,
         )

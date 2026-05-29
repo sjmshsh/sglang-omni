@@ -315,15 +315,51 @@ def create_vocoder_executor(
         )
 
     def _decode_waveforms(segments: list[torch.Tensor]) -> list[torch.Tensor]:
-        decoded = processor.decode_audio_codes(segments) if segments else []
+        decoded = []
+        for segment in segments:
+            segment_wavs = processor.decode_audio_codes([segment])
+            decoded.extend(segment_wavs)
         if not decoded:
             raise RuntimeError("MOSS-TTS vocoder decoded no audio segments")
         return [
             torch.as_tensor(wav).detach().reshape(-1).to("cpu") for wav in decoded
         ]
 
-    def _decode_segments(segments: list[torch.Tensor]) -> torch.Tensor:
+    def _trim_assistant_prefix_audio(
+        waveforms: list[torch.Tensor],
+        segments: list[torch.Tensor],
+        assistant_start_length: int,
+    ) -> list[torch.Tensor]:
+        if assistant_start_length <= 0 or not waveforms or not segments:
+            return waveforms
+        first_codes_length = int(segments[0].shape[0])
+        if first_codes_length <= 0:
+            return waveforms
+        trim_ratio = max(
+            0.0,
+            min(float(assistant_start_length) / float(first_codes_length), 1.0),
+        )
+        if trim_ratio >= 1.0:
+            return waveforms[1:]
+        if trim_ratio <= 0.0:
+            return waveforms
+        trim_samples = int(waveforms[0].shape[-1] * trim_ratio)
+        waveforms[0] = waveforms[0][trim_samples:]
+        return waveforms
+
+    def _decode_segments(
+        segments: list[torch.Tensor],
+        *,
+        assistant_start_length: int,
+    ) -> torch.Tensor:
         waveforms = _decode_waveforms(segments)
+        waveforms = _trim_assistant_prefix_audio(
+            waveforms,
+            segments,
+            assistant_start_length,
+        )
+        if not waveforms:
+            raise RuntimeError("MOSS-TTS vocoder decoded no audio after trimming")
         return torch.cat(waveforms, dim=0)
 
     def _decode_audio(
@@ -331,7 +367,10 @@ def create_vocoder_executor(
         delayed_codes: torch.Tensor,
     ) -> tuple[torch.Tensor, int]:
         segments = _extract_audio_segments(state, delayed_codes)
-        waveform = _decode_segments(segments)
+        waveform = _decode_segments(
+            segments,
+            assistant_start_length=int(state.assistant_start_length),
+        )
         return waveform, _processor_sample_rate(processor, state.sample_rate)
 
     def _store_vocoder_result(

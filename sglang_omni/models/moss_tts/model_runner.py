@@ -246,6 +246,7 @@ class MossTTSModelRunner(ModelRunner):
             )
 
         self._update_delay_state(data, int(text_token), n_vq=n_vq)
+        data.generation_steps = int(data.generation_steps) + 1
         return int(text_token), audio_tokens
 
     def _next_text_token(self, logits: torch.Tensor, *, data: Any, n_vq: int) -> int:
