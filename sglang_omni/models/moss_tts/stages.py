@@ -52,6 +52,13 @@ def _torch_dtype(dtype: str | torch.dtype) -> torch.dtype:
     return getattr(torch, dtype) if isinstance(dtype, str) else dtype
 
 
+def _resolve_stage_device(device: str, gpu_id: int | None) -> tuple[str, int]:
+    if gpu_id is not None:
+        device = f"cuda:{gpu_id}"
+    resolved_gpu_id = int(device.split(":")[-1]) if ":" in device else 0
+    return device, resolved_gpu_id
+
+
 def _patch_moss_transformers_processor_compat() -> None:
     """Patch small Transformers API drifts used by MOSS remote processor code."""
     import transformers.configuration_utils as configuration_utils
@@ -159,6 +166,17 @@ def _build_usage(state: MossTTSState) -> dict[str, Any] | None:
     return usage
 
 
+def _processor_sample_rate(processor: Any, fallback: int = 24000) -> int:
+    model_config = getattr(processor, "model_config", None)
+    audio_config = getattr(getattr(processor, "audio_tokenizer", None), "config", None)
+    return int(
+        getattr(model_config, "sampling_rate", 0)
+        or getattr(audio_config, "sampling_rate", 0)
+        or fallback
+        or 24000
+    )
+
+
 def create_preprocessing_executor(model_path: str) -> SimpleScheduler:
     processor = _load_moss_processor(model_path, device="cpu", dtype="float32")
     set_moss_tts_preprocessing_context(processor=processor)
@@ -184,9 +202,7 @@ def create_sglang_tts_engine_executor(
     )
 
     checkpoint_dir = _resolve_checkpoint(model_path)
-    if gpu_id is not None:
-        device = f"cuda:{gpu_id}"
-    gpu_id = int(device.split(":")[-1]) if ":" in device else 0
+    _, gpu_id = _resolve_stage_device(device, gpu_id)
 
     server_args = build_sglang_server_args(
         checkpoint_dir,
@@ -266,9 +282,15 @@ def create_vocoder_executor(
     max_batch_size: int = 8,
     max_batch_wait_ms: int = 2,
 ) -> SimpleScheduler:
-    if gpu_id is not None:
-        device = f"cuda:{gpu_id}"
+    device, _ = _resolve_stage_device(device, gpu_id)
     processor = _load_moss_processor(model_path, device=device, dtype=dtype)
+    audio_pad_code = int(
+        getattr(
+            getattr(processor, "model_config", None),
+            "audio_pad_code",
+            1024,
+        )
+    )
 
     def _prepare_vocoder_item(
         payload: StagePayload,
@@ -281,43 +303,36 @@ def create_vocoder_executor(
             raise RuntimeError("MOSS-TTS generated no delayed audio codes")
         return state, delayed_codes
 
-    def _decode_audio(
+    def _extract_audio_segments(
         state: MossTTSState,
         delayed_codes: torch.Tensor,
-    ) -> tuple[torch.Tensor, int]:
+    ) -> list[torch.Tensor]:
         delayed_codes = delayed_codes.to(device=device, dtype=torch.long)
-        audio_pad_code = int(
-            getattr(
-                getattr(processor, "model_config", None),
-                "audio_pad_code",
-                1024,
-            )
-        )
-        segments = split_moss_audio_segments(
+        return split_moss_audio_segments(
             delayed_codes,
             audio_pad_code=audio_pad_code,
             assistant_start_length=int(state.assistant_start_length),
         )
-        decoded = []
-        for segment in segments:
-            decoded.extend(processor.decode_audio_codes([segment]))
+
+    def _decode_waveforms(segments: list[torch.Tensor]) -> list[torch.Tensor]:
+        decoded = processor.decode_audio_codes(segments) if segments else []
         if not decoded:
             raise RuntimeError("MOSS-TTS vocoder decoded no audio segments")
-        waveforms = [
+        return [
             torch.as_tensor(wav).detach().reshape(-1).to("cpu") for wav in decoded
         ]
-        waveform = torch.cat(waveforms, dim=0)
-        sample_rate = int(
-            getattr(getattr(processor, "model_config", None), "sampling_rate", 0)
-            or getattr(
-                getattr(getattr(processor, "audio_tokenizer", None), "config", None),
-                "sampling_rate",
-                0,
-            )
-            or state.sample_rate
-            or 24000
-        )
-        return waveform, sample_rate
+
+    def _decode_segments(segments: list[torch.Tensor]) -> torch.Tensor:
+        waveforms = _decode_waveforms(segments)
+        return torch.cat(waveforms, dim=0)
+
+    def _decode_audio(
+        state: MossTTSState,
+        delayed_codes: torch.Tensor,
+    ) -> tuple[torch.Tensor, int]:
+        segments = _extract_audio_segments(state, delayed_codes)
+        waveform = _decode_segments(segments)
+        return waveform, _processor_sample_rate(processor, state.sample_rate)
 
     def _store_vocoder_result(
         payload: StagePayload,
@@ -343,7 +358,31 @@ def create_vocoder_executor(
         return _store_vocoder_result(payload, state, wav, sample_rate)
 
     def _vocode_batch(payloads: list[StagePayload]) -> list[StagePayload]:
-        return [_vocode(payload) for payload in payloads]
+        prepared = [_prepare_vocoder_item(payload) for payload in payloads]
+        segment_groups: list[tuple[int, int]] = []
+        all_segments: list[torch.Tensor] = []
+        for state, delayed_codes in prepared:
+            start = len(all_segments)
+            segments = _extract_audio_segments(state, delayed_codes)
+            all_segments.extend(segments)
+            segment_groups.append((start, len(all_segments)))
+
+        decoded = _decode_waveforms(all_segments) if all_segments else []
+        if len(decoded) != len(all_segments):
+            raise RuntimeError("MOSS-TTS vocoder decoded an unexpected segment count")
+
+        results = []
+        for payload, (state, _), (start, end) in zip(
+            payloads, prepared, segment_groups
+        ):
+            if start == end:
+                raise RuntimeError("MOSS-TTS vocoder decoded no audio segments")
+            waveform = torch.cat(decoded[start:end], dim=0)
+            sample_rate = _processor_sample_rate(processor, state.sample_rate)
+            results.append(
+                _store_vocoder_result(payload, state, waveform, sample_rate)
+            )
+        return results
 
     return SimpleScheduler(
         _vocode,
