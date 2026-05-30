@@ -8,7 +8,11 @@ from copy import copy
 from typing import Any, Iterable, Optional, Tuple
 
 import torch
-from sglang.srt.distributed import get_pp_group
+from sglang.srt.distributed import (
+    get_pp_group,
+    get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_gather,
+)
 from sglang.srt.layers.logits_processor import (
     LogitsMetadata,
     LogitsProcessor,
@@ -30,6 +34,26 @@ from sglang.srt.models.qwen3 import Qwen3Model
 from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
+
+
+class MossTTSChannelLogits:
+    """Lazy list-like wrapper for text logits plus fused audio logits."""
+
+    def __init__(
+        self,
+        text_logits: torch.Tensor,
+        audio_logits: torch.Tensor,
+    ) -> None:
+        self.text_logits = text_logits
+        self.audio_logits = audio_logits
+
+    def __len__(self) -> int:
+        return 1 + int(self.audio_logits.shape[1])
+
+    def __getitem__(self, index: int) -> torch.Tensor:
+        if index == 0:
+            return self.text_logits
+        return self.audio_logits[:, index - 1, :]
 
 
 def _as_qwen3_config(config: Any) -> Any:
@@ -118,6 +142,14 @@ class MossTTSDelaySGLangModel(torch.nn.Module):
             ]
         )
         self._pad_token_per_channel = self._compute_pad_token_per_channel()
+        self.register_buffer(
+            "_fused_audio_lm_head_weight",
+            torch.empty(0),
+            persistent=False,
+        )
+        self._fused_audio_lm_head_enabled = False
+        self._fused_audio_lm_head_local_vocab_size = 0
+        self._fused_audio_lm_head_needs_tp_gather = False
 
         max_batch_size = getattr(getattr(self, "config", None), "max_batch_size", None)
         try:
@@ -329,11 +361,171 @@ class MossTTSDelaySGLangModel(torch.nn.Module):
         self,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-    ) -> list[torch.Tensor]:
-        return [
-            output.next_token_logits
-            for output in self.compute_channel_outputs(hidden_states, forward_batch)
-        ]
+    ) -> MossTTSChannelLogits | list[torch.Tensor]:
+        logits_metadata = LogitsMetadata.from_forward_batch(forward_batch)
+        logits_metadata.next_token_logits_buffer = None
+        logits_metadata.forward_mode = ForwardMode.DECODE
+
+        text_logits = self._compute_channel_logits_fast(
+            channel=0,
+            hidden_states=hidden_states,
+            logits_metadata=logits_metadata,
+        )
+        if text_logits is None:
+            return [
+                output.next_token_logits
+                for output in self.compute_channel_outputs(
+                    hidden_states,
+                    forward_batch,
+                )
+            ]
+
+        fused_audio_logits = self._compute_fused_audio_logits(hidden_states)
+        if fused_audio_logits is not None:
+            return MossTTSChannelLogits(text_logits, fused_audio_logits)
+
+        logits = [text_logits]
+        for idx in range(1, self.config.channels):
+            channel_logits = self._compute_channel_logits_fast(
+                channel=idx,
+                hidden_states=hidden_states,
+                logits_metadata=logits_metadata,
+            )
+            if channel_logits is None:
+                return [
+                    output.next_token_logits
+                    for output in self.compute_channel_outputs(
+                        hidden_states,
+                        forward_batch,
+                    )
+                ]
+            logits.append(channel_logits)
+        return logits
+
+    def _compute_channel_logits_fast(
+        self,
+        *,
+        channel: int,
+        hidden_states: torch.Tensor,
+        logits_metadata: LogitsMetadata,
+    ) -> torch.Tensor | None:
+        processor = self.logits_processors[channel]
+        get_logits = getattr(processor, "_get_logits", None)
+        if not callable(get_logits):
+            return None
+        return get_logits(
+            hidden_states,
+            self.lm_heads[channel],
+            logits_metadata,
+        )
+
+    def _compute_fused_audio_logits(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor | None:
+        weight = self._fused_audio_lm_head_weight
+        if not self._fused_audio_lm_head_enabled or weight.numel() == 0:
+            return None
+        audio_vocab_size = int(self.config.vocab_size_list[1])
+        audio_channels = int(self.config.channels - 1)
+        local_vocab_size = int(self._fused_audio_lm_head_local_vocab_size)
+        logits = torch.matmul(hidden_states.to(weight.dtype), weight.T).float()
+        if self._fused_audio_lm_head_needs_tp_gather:
+            logits = tensor_model_parallel_all_gather(logits)
+        tp_size = (
+            int(get_tensor_model_parallel_world_size())
+            if self._fused_audio_lm_head_needs_tp_gather
+            else 1
+        )
+        # Gather order is rank-major; restore channel-major logits before trim.
+        logits = logits.view(
+            hidden_states.shape[0],
+            tp_size,
+            audio_channels,
+            local_vocab_size,
+        )
+        logits = logits.transpose(1, 2).reshape(
+            hidden_states.shape[0],
+            audio_channels,
+            tp_size * local_vocab_size,
+        )
+        return logits[:, :, :audio_vocab_size]
+
+    def _audio_lm_heads_are_fusable(self) -> bool:
+        if not self.pp_group.is_last_rank or self.config.channels <= 1:
+            return False
+        if self.quant_config is not None:
+            return False
+        vocab_size = int(self.config.vocab_size_list[1])
+        if any(int(vocab) != vocab_size for vocab in self.config.vocab_size_list[1:]):
+            return False
+        needs_tp_gather = bool(
+            getattr(
+                self.logits_processors[1],
+                "do_tensor_parallel_all_gather",
+                False,
+            )
+        )
+        for processor in self.logits_processors[1:]:
+            if getattr(processor, "use_attn_tp_group", False):
+                return False
+            if (
+                bool(getattr(processor, "do_tensor_parallel_all_gather", False))
+                != needs_tp_gather
+            ):
+                return False
+            if getattr(processor, "do_tensor_parallel_all_gather_dp_attn", False):
+                return False
+            if getattr(processor, "use_fp32_lm_head", False):
+                return False
+            if getattr(processor, "logit_scale", None) is not None:
+                return False
+            if getattr(processor, "final_logit_softcapping", None) is not None:
+                return False
+        return True
+
+    def _refresh_fused_audio_lm_head_weight(self) -> None:
+        if not self.pp_group.is_last_rank or self.config.channels <= 1:
+            self._clear_fused_audio_lm_head_weight()
+            return
+        if not self._audio_lm_heads_are_fusable():
+            self._clear_fused_audio_lm_head_weight()
+            return
+
+        weights = []
+        local_vocab_size = None
+        for head in self.lm_heads[1:]:
+            weight = getattr(head, "weight", None)
+            if not isinstance(weight, torch.Tensor):
+                self._clear_fused_audio_lm_head_weight()
+                return
+            if weight.ndim != 2:
+                self._clear_fused_audio_lm_head_weight()
+                return
+            this_local_vocab_size = int(weight.shape[0])
+            if local_vocab_size is None:
+                local_vocab_size = this_local_vocab_size
+            elif local_vocab_size != this_local_vocab_size:
+                self._clear_fused_audio_lm_head_weight()
+                return
+            weights.append(weight.detach())
+
+        self._fused_audio_lm_head_weight = torch.cat(weights, dim=0).contiguous()
+        self._fused_audio_lm_head_local_vocab_size = int(local_vocab_size or 0)
+        self._fused_audio_lm_head_needs_tp_gather = bool(
+            getattr(
+                self.logits_processors[1],
+                "do_tensor_parallel_all_gather",
+                False,
+            )
+        )
+        self._fused_audio_lm_head_enabled = True
+
+    def _clear_fused_audio_lm_head_weight(self) -> None:
+        self._fused_audio_lm_head_weight = self._first_embedding_weight().new_empty(0)
+        self._fused_audio_lm_head_enabled = False
+        self._fused_audio_lm_head_local_vocab_size = 0
+        self._fused_audio_lm_head_needs_tp_gather = False
 
     @staticmethod
     def _select_sample_hidden_states(
@@ -433,6 +625,7 @@ class MossTTSDelaySGLangModel(torch.nn.Module):
                 self._load_param(param, loaded_weight)
             else:
                 logger.warning("MOSS-TTS parameter %s not found", original_name)
+        self._refresh_fused_audio_lm_head_weight()
 
     @staticmethod
     def _map_audio_embedding_name(name: str) -> str | None:
@@ -463,6 +656,7 @@ class MossTTSDelaySGLangModel(torch.nn.Module):
             for idx, head in enumerate(head_list[: len(self.lm_heads)]):
                 if head is not None and hasattr(self.lm_heads[idx], "weight"):
                     self.lm_heads[idx].weight = head
+        self._refresh_fused_audio_lm_head_weight()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 

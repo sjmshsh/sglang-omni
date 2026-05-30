@@ -161,21 +161,34 @@ class MossTTSModelRunner(ModelRunner):
             raise RuntimeError("MOSS-TTS requires at least one audio codebook head")
 
         device = channel_logits[0].device
-        rows = []
         text_tokens = []
+        active_masks: list[list[bool]] = []
+        data_items = []
         for row_idx, sched_req in enumerate(requests):
             data = sched_req.data
-            text_token, audio_tokens = self._sample_next_row(
-                channel_logits,
-                row_idx=row_idx,
+            text_token = self._next_text_token(
+                channel_logits[0][row_idx],
                 data=data,
                 n_vq=n_vq,
             )
+            text_tokens.append(int(text_token))
+            active_masks.append(self._sampling_audio_mask(data, n_vq=n_vq))
+            data_items.append(data)
+
+        audio_token_batch = self._sample_audio_tokens_batch(
+            channel_logits,
+            data_items=data_items,
+            active_masks=active_masks,
+            n_vq=n_vq,
+        )
+
+        rows = []
+        for row_idx, (data, text_token) in enumerate(zip(data_items, text_tokens)):
             row = torch.empty(n_vq + 1, dtype=torch.long, device=device)
             row[0] = int(text_token)
-            row[1:] = audio_tokens
+            row[1:] = audio_token_batch[row_idx]
             rows.append(row)
-            text_tokens.append(int(text_token))
+            self._update_delay_state(data, int(text_token), n_vq=n_vq)
 
         next_token_ids = torch.tensor(text_tokens, dtype=torch.long, device=device)
         result.next_token_ids = next_token_ids
@@ -247,6 +260,96 @@ class MossTTSModelRunner(ModelRunner):
 
         self._update_delay_state(data, int(text_token), n_vq=n_vq)
         return int(text_token), audio_tokens
+
+    def _sample_audio_tokens_batch(
+        self,
+        channel_logits: list[torch.Tensor],
+        *,
+        data_items: list[Any],
+        active_masks: list[list[bool]],
+        n_vq: int,
+    ) -> torch.Tensor:
+        cfg = self.model.config
+        device = channel_logits[0].device
+        batch_size = len(data_items)
+        audio_tokens = torch.full(
+            (batch_size, n_vq),
+            int(cfg.audio_pad_code),
+            dtype=torch.long,
+            device=device,
+        )
+        active_pairs = [
+            (row_idx, vq_idx)
+            for row_idx, mask in enumerate(active_masks)
+            for vq_idx, active in enumerate(mask)
+            if active
+        ]
+        if not active_pairs:
+            return audio_tokens
+
+        fused_audio_logits = getattr(channel_logits, "audio_logits", None)
+        if isinstance(fused_audio_logits, torch.Tensor):
+            audio_logits = fused_audio_logits[:batch_size]
+        else:
+            audio_logits = torch.stack(
+                [channel_logits[vq_idx + 1][:batch_size] for vq_idx in range(n_vq)],
+                dim=1,
+            )
+        pair_rows = torch.tensor(
+            [row_idx for row_idx, _ in active_pairs],
+            dtype=torch.long,
+            device=device,
+        )
+        pair_vqs = torch.tensor(
+            [vq_idx for _, vq_idx in active_pairs],
+            dtype=torch.long,
+            device=device,
+        )
+        active_logits = audio_logits[pair_rows, pair_vqs].clone()
+        active_logits[:, int(cfg.audio_pad_code)] = float("-inf")
+
+        samples = torch.empty(len(active_pairs), dtype=torch.long, device=device)
+        grouped: dict[tuple[float, float, int], list[int]] = {}
+        fallback_indices: list[int] = []
+        for sample_idx, (row_idx, _) in enumerate(active_pairs):
+            data = data_items[row_idx]
+            if float(data.audio_repetition_penalty) != 1.0:
+                fallback_indices.append(sample_idx)
+                continue
+            key = (
+                float(data.audio_temperature),
+                float(data.audio_top_p),
+                int(data.audio_top_k),
+            )
+            grouped.setdefault(key, []).append(sample_idx)
+
+        for (temperature, top_p, top_k), sample_indices in grouped.items():
+            idx = torch.tensor(sample_indices, dtype=torch.long, device=device)
+            samples.index_copy_(
+                0,
+                idx,
+                self._sample_logits_batch(
+                    active_logits.index_select(0, idx),
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                ),
+            )
+
+        for sample_idx in fallback_indices:
+            row_idx, vq_idx = active_pairs[sample_idx]
+            data = data_items[row_idx]
+            samples[sample_idx] = self._sample_logits(
+                active_logits[sample_idx],
+                temperature=float(data.audio_temperature),
+                top_p=float(data.audio_top_p),
+                top_k=int(data.audio_top_k),
+                repetition_penalty=float(data.audio_repetition_penalty),
+                prev_tokens=self._previous_audio_tokens(data, vq_idx),
+            )
+
+        audio_tokens[pair_rows, pair_vqs] = samples
+        return audio_tokens
 
     def _next_text_token(self, logits: torch.Tensor, *, data: Any, n_vq: int) -> int:
         cfg = self.model.config
@@ -420,6 +523,101 @@ class MossTTSModelRunner(ModelRunner):
             return torch.multinomial(probs, 1).squeeze(0).to(dtype=torch.long)
         except RuntimeError:
             return torch.argmax(scores, dim=-1).to(dtype=torch.long)
+
+    @staticmethod
+    def _sample_logits_batch(
+        logits: torch.Tensor,
+        *,
+        temperature: float,
+        top_p: float,
+        top_k: int,
+    ) -> torch.Tensor:
+        if logits.ndim != 2:
+            raise ValueError("batched MOSS-TTS sampling expects rank-2 logits")
+        if logits.shape[0] == 0:
+            return torch.empty((0,), dtype=torch.long, device=logits.device)
+
+        scores = logits.to(dtype=torch.float32).clone()
+        finite_rows = torch.isfinite(scores).any(dim=-1)
+        safe_scores = torch.where(
+            torch.isfinite(scores),
+            scores,
+            torch.full_like(scores, float("-inf")),
+        )
+        fallback = torch.argmax(safe_scores, dim=-1).to(dtype=torch.long)
+        fallback = torch.where(
+            finite_rows,
+            fallback,
+            torch.zeros_like(fallback),
+        )
+
+        if temperature <= 0:
+            return fallback
+
+        scores = scores / float(temperature)
+        vocab_size = int(scores.shape[-1])
+        use_top_k = top_k is not None and int(top_k) > 0 and int(top_k) < vocab_size
+        use_top_p = top_p is not None and 0.0 < float(top_p) < 1.0
+
+        if use_top_k:
+            work_scores, work_indices = torch.topk(scores, int(top_k), dim=-1)
+        elif use_top_p:
+            work_scores, work_indices = torch.sort(scores, dim=-1, descending=True)
+        else:
+            probs = torch.softmax(scores, dim=-1)
+            probs = torch.where(torch.isfinite(probs), probs, torch.zeros_like(probs))
+            return MossTTSModelRunner._multinomial_or_argmax(
+                probs,
+                fallback=fallback,
+                finite_rows=finite_rows,
+            )
+
+        if use_top_p:
+            sorted_probs = torch.softmax(work_scores, dim=-1)
+            remove = torch.cumsum(sorted_probs, dim=-1) > float(top_p)
+            if remove.shape[-1] > 1:
+                remove[:, 1:] = remove[:, :-1].clone()
+            remove[:, 0] = False
+            work_scores = work_scores.masked_fill(remove, float("-inf"))
+
+        probs = torch.softmax(work_scores, dim=-1)
+        probs = torch.where(torch.isfinite(probs), probs, torch.zeros_like(probs))
+        sampled_rank = MossTTSModelRunner._multinomial_or_argmax(
+            probs,
+            fallback=None,
+            finite_rows=finite_rows,
+        )
+        sampled = work_indices.gather(1, sampled_rank.unsqueeze(1)).squeeze(1)
+        row_sums = probs.sum(dim=-1)
+        good_rows = finite_rows & torch.isfinite(row_sums) & (row_sums > 0)
+        return torch.where(good_rows, sampled.to(torch.long), fallback)
+
+    @staticmethod
+    def _multinomial_or_argmax(
+        probs: torch.Tensor,
+        *,
+        fallback: torch.Tensor | None,
+        finite_rows: torch.Tensor,
+    ) -> torch.Tensor:
+        row_sums = probs.sum(dim=-1)
+        good_rows = finite_rows & torch.isfinite(row_sums) & (row_sums > 0)
+        if fallback is None:
+            fallback = torch.zeros(probs.shape[0], dtype=torch.long, device=probs.device)
+        safe_probs = torch.where(
+            good_rows.unsqueeze(1),
+            probs,
+            torch.zeros_like(probs),
+        )
+        safe_probs[:, 0] = torch.where(
+            good_rows,
+            safe_probs[:, 0],
+            torch.ones_like(safe_probs[:, 0]),
+        )
+        try:
+            sampled = torch.multinomial(safe_probs, 1).squeeze(1)
+        except RuntimeError:
+            sampled = torch.argmax(safe_probs, dim=-1).to(dtype=torch.long)
+        return torch.where(good_rows, sampled.to(dtype=torch.long), fallback)
 
     def _update_delay_state(self, data: Any, text_token: int, *, n_vq: int) -> None:
         cfg = self.model.config

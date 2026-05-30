@@ -314,15 +314,18 @@ def create_vocoder_executor(
         )
 
     def _decode_waveforms(segments: list[torch.Tensor]) -> list[torch.Tensor]:
-        decoded = []
         for segment in segments:
             if ((segment < 0) | (segment >= audio_pad_code)).any():
                 raise RuntimeError(
                     "MOSS-TTS vocoder received an incomplete audio code segment; "
                     "refusing to decode pad/out-of-range code ids"
                 )
-            segment_wavs = processor.decode_audio_codes([segment])
-            decoded.extend(segment_wavs)
+        try:
+            decoded = processor.decode_audio_codes(segments)
+        except (RuntimeError, TypeError, ValueError):
+            decoded = []
+            for segment in segments:
+                decoded.extend(processor.decode_audio_codes([segment]))
         if not decoded:
             raise RuntimeError("MOSS-TTS vocoder decoded no audio segments")
         return [
@@ -420,7 +423,14 @@ def create_vocoder_executor(
         ):
             if start == end:
                 raise RuntimeError("MOSS-TTS vocoder decoded no audio segments")
-            waveform = torch.cat(decoded[start:end], dim=0)
+            waveforms = _trim_assistant_prefix_audio(
+                decoded[start:end],
+                all_segments[start:end],
+                int(state.assistant_start_length),
+            )
+            if not waveforms:
+                raise RuntimeError("MOSS-TTS vocoder decoded no audio after trimming")
+            waveform = torch.cat(waveforms, dim=0)
             sample_rate = _processor_sample_rate(processor, state.sample_rate)
             results.append(
                 _store_vocoder_result(payload, state, waveform, sample_rate)
