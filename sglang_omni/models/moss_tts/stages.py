@@ -311,7 +311,6 @@ def create_vocoder_executor(
         return split_moss_audio_segments(
             delayed_codes,
             audio_pad_code=audio_pad_code,
-            assistant_start_length=int(state.assistant_start_length),
         )
 
     def _decode_waveforms(segments: list[torch.Tensor]) -> list[torch.Tensor]:
