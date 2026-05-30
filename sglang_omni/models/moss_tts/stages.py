@@ -16,6 +16,7 @@ from sglang_omni.models.moss_tts.request_builders import (
     cleanup_prepared_moss_tts_request,
     make_moss_tts_scheduler_adapters,
     preprocess_moss_tts_payload,
+    preprocess_moss_tts_payloads,
     set_moss_tts_preprocessing_context,
 )
 from sglang_omni.proto import StagePayload
@@ -177,11 +178,23 @@ def _processor_sample_rate(processor: Any, fallback: int = 24000) -> int:
     )
 
 
-def create_preprocessing_executor(model_path: str) -> SimpleScheduler:
-    processor = _load_moss_processor(model_path, device="cpu", dtype="float32")
+def create_preprocessing_executor(
+    model_path: str,
+    *,
+    device: str = "cpu",
+    gpu_id: int | None = None,
+    dtype: str = "float32",
+    max_batch_size: int = 16,
+    max_batch_wait_ms: int = 2,
+) -> SimpleScheduler:
+    device, _ = _resolve_stage_device(device, gpu_id)
+    processor = _load_moss_processor(model_path, device=device, dtype=dtype)
     set_moss_tts_preprocessing_context(processor=processor)
     return SimpleScheduler(
         preprocess_moss_tts_payload,
+        batch_compute_fn=preprocess_moss_tts_payloads,
+        max_batch_size=max_batch_size,
+        max_batch_wait_ms=max_batch_wait_ms,
         abort_callback=cleanup_prepared_moss_tts_request,
     )
 
@@ -191,7 +204,12 @@ def create_sglang_tts_engine_executor(
     *,
     device: str = "cuda:0",
     gpu_id: int | None = None,
+    tp_rank: int = 0,
+    tp_size: int = 1,
+    nccl_port: int | None = None,
     dtype: str = "bfloat16",
+    server_args_overrides: dict[str, Any] | None = None,
+    total_gpu_memory_fraction: float | None = None,
 ) -> Any:
     from sglang_omni.models.moss_tts.model_runner import MossTTSModelRunner
     from sglang_omni.scheduling.bootstrap import create_sglang_infrastructure
@@ -204,21 +222,28 @@ def create_sglang_tts_engine_executor(
     checkpoint_dir = _resolve_checkpoint(model_path)
     _, gpu_id = _resolve_stage_device(device, gpu_id)
 
+    overrides: dict[str, Any] = {
+        "dtype": dtype,
+        "tp_size": tp_size,
+        "cuda_graph_bs": [1, 2, 4, 8, 16],
+        "cuda_graph_max_bs": 16,
+        "disable_cuda_graph": False,
+        "disable_overlap_schedule": True,
+        "enable_torch_compile": True,
+        "mem_fraction_static": 0.70,
+        "sampling_backend": "pytorch",
+        "torch_compile_max_bs": 16,
+        "trust_remote_code": True,
+    }
+    if server_args_overrides:
+        overrides.update(server_args_overrides)
+
     server_args = build_sglang_server_args(
         checkpoint_dir,
         context_length=8192,
-        dtype=dtype,
-        cuda_graph_bs=[1, 2, 4, 8, 16],
-        cuda_graph_max_bs=16,
-        disable_cuda_graph=False,
-        disable_overlap_schedule=True,
-        enable_torch_compile=True,
-        mem_fraction_static=0.70,
         max_prefill_tokens=8192,
         max_running_requests=16,
-        sampling_backend="pytorch",
-        torch_compile_max_bs=16,
-        trust_remote_code=True,
+        **overrides,
     )
 
     want_cuda_graph = not bool(getattr(server_args, "disable_cuda_graph", False))
@@ -236,7 +261,10 @@ def create_sglang_tts_engine_executor(
     ) = create_sglang_infrastructure(
         server_args,
         gpu_id,
+        tp_rank=tp_rank,
+        nccl_port=nccl_port,
         model_arch_override="MossTTSDelaySGLangModel",
+        total_gpu_memory_fraction=total_gpu_memory_fraction,
     )
 
     if want_cuda_graph:
@@ -279,7 +307,7 @@ def create_vocoder_executor(
     device: str = "cuda:0",
     gpu_id: int | None = None,
     dtype: str = "float32",
-    max_batch_size: int = 8,
+    max_batch_size: int = 16,
     max_batch_wait_ms: int = 2,
 ) -> SimpleScheduler:
     device, _ = _resolve_stage_device(device, gpu_id)
@@ -321,11 +349,13 @@ def create_vocoder_executor(
                     "refusing to decode pad/out-of-range code ids"
                 )
         try:
-            decoded = processor.decode_audio_codes(segments)
+            with torch.inference_mode():
+                decoded = processor.decode_audio_codes(segments)
         except (RuntimeError, TypeError, ValueError):
             decoded = []
             for segment in segments:
-                decoded.extend(processor.decode_audio_codes([segment]))
+                with torch.inference_mode():
+                    decoded.extend(processor.decode_audio_codes([segment]))
         if not decoded:
             raise RuntimeError("MOSS-TTS vocoder decoded no audio segments")
         return [

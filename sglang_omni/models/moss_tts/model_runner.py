@@ -161,19 +161,15 @@ class MossTTSModelRunner(ModelRunner):
             raise RuntimeError("MOSS-TTS requires at least one audio codebook head")
 
         device = channel_logits[0].device
-        text_tokens = []
-        active_masks: list[list[bool]] = []
-        data_items = []
-        for row_idx, sched_req in enumerate(requests):
-            data = sched_req.data
-            text_token = self._next_text_token(
-                channel_logits[0][row_idx],
-                data=data,
-                n_vq=n_vq,
-            )
-            text_tokens.append(int(text_token))
-            active_masks.append(self._sampling_audio_mask(data, n_vq=n_vq))
-            data_items.append(data)
+        data_items = [sched_req.data for sched_req in requests]
+        text_token_batch = self._sample_text_tokens_batch(
+            channel_logits[0],
+            data_items=data_items,
+            n_vq=n_vq,
+        )
+        active_masks = [
+            self._sampling_audio_mask(data, n_vq=n_vq) for data in data_items
+        ]
 
         audio_token_batch = self._sample_audio_tokens_batch(
             channel_logits,
@@ -182,18 +178,22 @@ class MossTTSModelRunner(ModelRunner):
             n_vq=n_vq,
         )
 
-        rows = []
-        for row_idx, (data, text_token) in enumerate(zip(data_items, text_tokens)):
-            row = torch.empty(n_vq + 1, dtype=torch.long, device=device)
-            row[0] = int(text_token)
-            row[1:] = audio_token_batch[row_idx]
-            rows.append(row)
+        rows = torch.empty(
+            (len(data_items), n_vq + 1),
+            dtype=torch.long,
+            device=device,
+        )
+        rows[:, 0] = text_token_batch
+        rows[:, 1:] = audio_token_batch
+
+        next_token_ids = text_token_batch.to(dtype=torch.long)
+        text_tokens = next_token_ids.detach().cpu().tolist()
+        for data, text_token in zip(data_items, text_tokens):
             self._update_delay_state(data, int(text_token), n_vq=n_vq)
 
-        next_token_ids = torch.tensor(text_tokens, dtype=torch.long, device=device)
         result.next_token_ids = next_token_ids
         schedule_batch.output_ids = next_token_ids
-        self._pending_rows = torch.stack(rows, dim=0)
+        self._pending_rows = rows
         self._pending_embeds = self.model._prepare_multi_modal_inputs(
             self._pending_rows.to(device=self.model.device)
         ).detach()
@@ -350,6 +350,192 @@ class MossTTSModelRunner(ModelRunner):
 
         audio_tokens[pair_rows, pair_vqs] = samples
         return audio_tokens
+
+    def _sample_text_tokens_batch(
+        self,
+        logits: torch.Tensor,
+        *,
+        data_items: list[Any],
+        n_vq: int,
+    ) -> torch.Tensor:
+        cfg = self.model.config
+        batch_size = len(data_items)
+        device = logits.device
+        tokens = torch.empty(batch_size, dtype=torch.long, device=device)
+        if batch_size == 0:
+            return tokens
+
+        forced_delay_rows: list[int] = []
+        forced_end_rows: list[int] = []
+        audio_rows_by_delay: dict[bool, list[int]] = {False: [], True: []}
+        text_rows: list[int] = []
+        for row_idx, data in enumerate(data_items):
+            delayed_length = self._delayed_length_value(data.delayed_length)
+            if delayed_length is not None and delayed_length < n_vq:
+                forced_delay_rows.append(row_idx)
+            elif delayed_length == n_vq:
+                forced_end_rows.append(row_idx)
+            elif bool(data.is_audio):
+                audio_rows_by_delay[int(data.generation_steps) != 0].append(row_idx)
+            else:
+                text_rows.append(row_idx)
+
+        self._fill_token_rows(
+            tokens,
+            forced_delay_rows,
+            int(cfg.audio_assistant_delay_slot_token_id),
+        )
+        self._fill_token_rows(tokens, forced_end_rows, int(cfg.audio_end_token_id))
+        for include_delay, rows in audio_rows_by_delay.items():
+            self._sample_audio_mode_text_tokens_batch(
+                logits,
+                tokens=tokens,
+                data_items=data_items,
+                rows=rows,
+                include_delay=include_delay,
+            )
+        self._sample_non_audio_text_tokens_batch(
+            logits,
+            tokens=tokens,
+            data_items=data_items,
+            rows=text_rows,
+            n_vq=n_vq,
+        )
+        return tokens
+
+    @staticmethod
+    def _fill_token_rows(
+        tokens: torch.Tensor,
+        rows: list[int],
+        token_id: int,
+    ) -> None:
+        if not rows:
+            return
+        row_tensor = torch.tensor(rows, dtype=torch.long, device=tokens.device)
+        tokens.index_fill_(0, row_tensor, int(token_id))
+
+    def _sample_audio_mode_text_tokens_batch(
+        self,
+        logits: torch.Tensor,
+        *,
+        tokens: torch.Tensor,
+        data_items: list[Any],
+        rows: list[int],
+        include_delay: bool,
+    ) -> None:
+        if not rows:
+            return
+        row_tensor = torch.tensor(rows, dtype=torch.long, device=logits.device)
+        candidate_ids = self._audio_mode_text_token_ids(
+            logits,
+            include_delay=include_delay,
+        )
+        if candidate_ids.numel() == 0:
+            tokens.index_fill_(0, row_tensor, 0)
+            return
+        if candidate_ids.numel() == 1:
+            tokens.index_copy_(0, row_tensor, candidate_ids.expand(len(rows)))
+            return
+
+        candidate_logits = logits.index_select(0, row_tensor).index_select(
+            1,
+            candidate_ids,
+        )
+        sampled_rank = torch.empty(len(rows), dtype=torch.long, device=logits.device)
+        grouped: dict[tuple[float, float, int], list[int]] = {}
+        for local_idx, row_idx in enumerate(rows):
+            data = data_items[row_idx]
+            key = (
+                float(data.text_temperature),
+                float(data.text_top_p),
+                int(data.text_top_k),
+            )
+            grouped.setdefault(key, []).append(local_idx)
+
+        for (temperature, top_p, top_k), sample_indices in grouped.items():
+            idx = torch.tensor(sample_indices, dtype=torch.long, device=logits.device)
+            sampled_rank.index_copy_(
+                0,
+                idx,
+                self._sample_logits_batch(
+                    candidate_logits.index_select(0, idx),
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                ),
+            )
+
+        sampled = candidate_ids.index_select(0, sampled_rank)
+        tokens.index_copy_(0, row_tensor, sampled)
+
+    def _sample_non_audio_text_tokens_batch(
+        self,
+        logits: torch.Tensor,
+        *,
+        tokens: torch.Tensor,
+        data_items: list[Any],
+        rows: list[int],
+        n_vq: int,
+    ) -> None:
+        if not rows:
+            return
+
+        cfg = self.model.config
+        row_tensor = torch.tensor(rows, dtype=torch.long, device=logits.device)
+        masked = logits.index_select(0, row_tensor).clone()
+        excluded = [
+            int(cfg.pad_token_id),
+            int(cfg.audio_assistant_gen_slot_token_id),
+            int(cfg.audio_assistant_delay_slot_token_id),
+            int(cfg.audio_end_token_id),
+        ]
+        valid_excluded = [
+            token_id for token_id in excluded if 0 <= token_id < masked.shape[-1]
+        ]
+        if valid_excluded:
+            excluded_tensor = torch.tensor(
+                valid_excluded,
+                dtype=torch.long,
+                device=logits.device,
+            )
+            masked[:, excluded_tensor] = float("-inf")
+
+        generation_steps = torch.tensor(
+            [int(data_items[row_idx].generation_steps) for row_idx in rows],
+            dtype=torch.long,
+            device=logits.device,
+        )
+        delay_token_id = int(cfg.audio_assistant_delay_slot_token_id)
+        if 0 <= delay_token_id < masked.shape[-1]:
+            masked[generation_steps == 0, delay_token_id] = float("-inf")
+        im_end_token_id = int(cfg.im_end_token_id)
+        if 0 <= im_end_token_id < masked.shape[-1]:
+            masked[generation_steps <= n_vq, im_end_token_id] = float("-inf")
+
+        samples = torch.empty(len(rows), dtype=torch.long, device=logits.device)
+        grouped: dict[tuple[float, float, int], list[int]] = {}
+        for local_idx, row_idx in enumerate(rows):
+            data = data_items[row_idx]
+            key = (
+                float(data.text_temperature),
+                float(data.text_top_p),
+                int(data.text_top_k),
+            )
+            grouped.setdefault(key, []).append(local_idx)
+
+        for (temperature, top_p, top_k), sample_indices in grouped.items():
+            idx = torch.tensor(sample_indices, dtype=torch.long, device=logits.device)
+            samples.index_copy_(
+                0,
+                idx,
+                self._sample_logits_batch(
+                    masked.index_select(0, idx),
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                ),
+            )
+        tokens.index_copy_(0, row_tensor, samples)
 
     def _next_text_token(self, logits: torch.Tensor, *, data: Any, n_vq: int) -> int:
         cfg = self.model.config
@@ -629,6 +815,7 @@ class MossTTSModelRunner(ModelRunner):
             data.audio_length = int(data.audio_length) + 1
         if text_token == int(cfg.audio_end_token_id):
             data.audio_length = 0
+            data.is_audio = False
         if text_token == int(cfg.audio_start_token_id):
             data.is_audio = True
         if text_token == int(cfg.im_end_token_id):

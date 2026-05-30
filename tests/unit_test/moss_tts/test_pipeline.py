@@ -27,7 +27,9 @@ from sglang_omni.models.moss_tts.request_builders import (
     build_row_cache_key_ids,
     build_sglang_moss_tts_request,
     clear_moss_tts_preprocessing_context,
+    pop_prepared_moss_tts_request,
     preprocess_moss_tts_payload,
+    preprocess_moss_tts_payloads,
     _reference_for_processor,
     set_moss_tts_preprocessing_context,
 )
@@ -118,6 +120,11 @@ def make_payload(
 
 
 def test_moss_tts_config_and_registry_contracts() -> None:
+    from sglang_omni.config import (
+        build_process_topology_plan,
+        build_stage_placement_plan,
+    )
+
     config = MossTTSPipelineConfig(model_path="model")
     assert [stage.name for stage in config.stages] == [
         "preprocessing",
@@ -126,7 +133,26 @@ def test_moss_tts_config_and_registry_contracts() -> None:
     ]
     assert config.terminal_stages == ["vocoder"]
     assert config.gpu_placement == {"tts_engine": 0, "vocoder": 0}
-    assert {stage.process for stage in config.stages} == {"pipeline"}
+    assert [stage.process for stage in config.stages] == [
+        "preprocessing",
+        "tts_engine",
+        "vocoder",
+    ]
+    assert type(config).talker_role_to_stage() == {"talker": "tts_engine"}
+    assert type(config).code2wav_stage() == "vocoder"
+    memory_fractions = {
+        stage.name: stage.runtime.resources.total_gpu_memory_fraction
+        for stage in config.stages
+    }
+    assert memory_fractions["tts_engine"] == pytest.approx(0.90)
+    assert memory_fractions["vocoder"] == pytest.approx(0.08)
+    placement_plan = build_stage_placement_plan(config)
+    process_plan = build_process_topology_plan(config, placement_plan)
+    assert {group.name for group in process_plan.groups} == {
+        "preprocessing",
+        "tts_engine",
+        "vocoder",
+    }
     assert (
         PIPELINE_CONFIG_REGISTRY.get_config("MossTTSDelayModel")
         is MossTTSPipelineConfig
@@ -317,6 +343,98 @@ def test_moss_preprocess_and_sglang_request_handoff(
     assert data.req.sampling_params.stop_token_ids == [151645]
 
 
+def test_moss_preprocess_batches_reference_paths_without_cache(tmp_path) -> None:
+    ref_a = tmp_path / "a.wav"
+    ref_b = tmp_path / "b.wav"
+    ref_a.write_bytes(b"a")
+    ref_b.write_bytes(b"b")
+
+    class FakeProcessor:
+        def __init__(self) -> None:
+            self.encoded_path_batches = []
+            self.message_kwargs = []
+
+        def encode_audios_from_path(self, paths):
+            self.encoded_path_batches.append(list(paths))
+            return [
+                torch.tensor([[idx + 1, idx + 2]], dtype=torch.long)
+                for idx, _ in enumerate(paths)
+            ]
+
+        def build_user_message(self, **kwargs):
+            self.message_kwargs.append(kwargs)
+            assert isinstance(kwargs["reference"][0], torch.Tensor)
+            return {"role": "user", **kwargs}
+
+        def __call__(self, conversations, mode):
+            assert mode == "generation"
+            assert len(conversations) == 2
+            return {
+                "input_ids": torch.tensor(
+                    [
+                        [
+                            [0, 1024, 1024],
+                            [11, 1024, 1024],
+                            [12, 5, 6],
+                        ],
+                        [
+                            [21, 1024, 1024],
+                            [22, 7, 8],
+                            [23, 9, 10],
+                        ],
+                    ],
+                    dtype=torch.long,
+                ),
+                "attention_mask": torch.tensor(
+                    [[False, True, True], [True, True, True]],
+                    dtype=torch.bool,
+                ),
+            }
+
+    processor = FakeProcessor()
+    payloads = [
+        make_payload(
+            request_id="a",
+            inputs={"text": "hello", "references": [{"path": str(ref_a)}]},
+        ),
+        make_payload(
+            request_id="b",
+            inputs={"text": "world", "references": [{"path": str(ref_b)}]},
+        ),
+    ]
+    second_payloads = [
+        make_payload(
+            request_id="a2",
+            inputs={"text": "hello", "references": [{"path": str(ref_a)}]},
+        ),
+        make_payload(
+            request_id="b2",
+            inputs={"text": "world", "references": [{"path": str(ref_b)}]},
+        ),
+    ]
+
+    try:
+        set_moss_tts_preprocessing_context(processor=processor)
+        prepared_payloads = preprocess_moss_tts_payloads(payloads)
+        prepared_a = pop_prepared_moss_tts_request(prepared_payloads[0])
+        prepared_b = pop_prepared_moss_tts_request(prepared_payloads[1])
+        preprocess_moss_tts_payloads(second_payloads)
+    finally:
+        clear_moss_tts_preprocessing_context()
+
+    assert processor.encoded_path_batches == [
+        [str(ref_a), str(ref_b)],
+        [str(ref_a), str(ref_b)],
+    ]
+    assert prepared_a is not None and prepared_b is not None
+    assert prepared_a.prompt_rows.tolist() == [[11, 1024, 1024], [12, 5, 6]]
+    assert prepared_b.prompt_rows.tolist() == [
+        [21, 1024, 1024],
+        [22, 7, 8],
+        [23, 9, 10],
+    ]
+
+
 def test_moss_generation_state_recovers_trailing_delay_prompt() -> None:
     cfg = SimpleNamespace(
         im_start_token_id=20,
@@ -457,6 +575,56 @@ def test_moss_audio_mode_first_step_disallows_delay_slot() -> None:
         runner._sample_audio_mode_text_token(logits, data=data)
         == cfg.audio_assistant_delay_slot_token_id
     )
+
+
+def test_moss_text_sampling_batch_preserves_delay_masks() -> None:
+    from sglang_omni.models.moss_tts.model_runner import MossTTSModelRunner
+
+    cfg = SimpleNamespace(
+        pad_token_id=0,
+        audio_start_token_id=10,
+        audio_end_token_id=11,
+        audio_assistant_gen_slot_token_id=12,
+        audio_assistant_delay_slot_token_id=13,
+        im_end_token_id=14,
+    )
+    runner = MossTTSModelRunner.__new__(MossTTSModelRunner)
+    runner.model = SimpleNamespace(config=cfg)
+    runner._audio_text_token_ids = {}
+
+    def data(**kwargs):
+        base = {
+            "delayed_length": _INF_DELAY,
+            "is_audio": False,
+            "generation_steps": 1,
+            "text_temperature": 0.0,
+            "text_top_p": 1.0,
+            "text_top_k": -1,
+        }
+        base.update(kwargs)
+        return SimpleNamespace(**base)
+
+    data_items = [
+        data(delayed_length=1, is_audio=True),
+        data(delayed_length=2, is_audio=True),
+        data(is_audio=True, generation_steps=0),
+        data(is_audio=False, generation_steps=0),
+    ]
+    logits = torch.full((4, 20), -100.0)
+    logits[:, cfg.audio_assistant_gen_slot_token_id] = 1.0
+    logits[:, cfg.audio_assistant_delay_slot_token_id] = 10.0
+    logits[3, cfg.pad_token_id] = 100.0
+    logits[3, cfg.im_end_token_id] = 90.0
+    logits[3, cfg.audio_start_token_id] = 20.0
+
+    tokens = runner._sample_text_tokens_batch(logits, data_items=data_items, n_vq=2)
+
+    assert tokens.tolist() == [
+        cfg.audio_assistant_delay_slot_token_id,
+        cfg.audio_end_token_id,
+        cfg.audio_assistant_gen_slot_token_id,
+        cfg.audio_start_token_id,
+    ]
 
 
 def test_moss_decode_feedback_uses_row_id_embedding() -> None:

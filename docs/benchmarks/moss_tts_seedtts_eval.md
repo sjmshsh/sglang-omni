@@ -14,6 +14,10 @@ pip install -U pip uv
 uv pip install -e .
 uv pip install funasr zhconv zhon openai-whisper s3prl soundfile scipy
 
+apt-get update
+apt-get install -y libnuma1
+apt-get install -y libibverbs1 ffmpeg
+
 ```bash
 cd /workspace/sglang-omni
 source .venv/bin/activate
