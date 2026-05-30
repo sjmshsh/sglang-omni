@@ -7,6 +7,13 @@ Use these commands from the container repo root:
 
 git checkout feature/support_moss_tts
 
+# 1. 安装 uv（若还没有）
+curl -LsSf https://astral.sh/uv/install.sh | sh
+export PATH="$HOME/.local/bin:$PATH"
+# 2. 创建虚拟环境并安装项目
+uv venv .venv -p python3.11
+source .venv/bin/activate
+
 python3 -m venv .venv
 source .venv/bin/activate
 
@@ -112,7 +119,7 @@ python -m benchmarks.eval.benchmark_tts_seedtts \
   --max-new-tokens 4096 \
   --token-count auto \
   --warmup 0 \
-  --max-concurrency 16 \
+  --max-concurrency 1 \
   --ref-format references \
   --device cuda:0 \
   --output-dir results/moss_tts_en_smoke50
@@ -147,7 +154,7 @@ python -m benchmarks.eval.benchmark_tts_seedtts \
   --max-new-tokens 4096 \
   --token-count auto \
   --warmup 0 \
-  --max-concurrency 16 \
+  --max-concurrency 1 \
   --ref-format references \
   --device cuda:0 \
   --output-dir results/moss_tts_zh_smoke50

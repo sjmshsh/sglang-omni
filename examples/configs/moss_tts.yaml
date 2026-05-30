@@ -1,17 +1,3 @@
 config_cls: MossTTSPipelineConfig
 model_path: OpenMOSS-Team/MOSS-TTS-v1.5
 relay_backend: shm
-
-# MOSS-TTS runs AR decoding and audio decoding as separate process groups for
-# throughput. When both are colocated on one GPU, Omni requires explicit memory
-# budgets so KV-cache profiling does not consume the vocoder headroom.
-stage_overrides:
-  tts_engine:
-    runtime:
-      resources:
-        total_gpu_memory_fraction: 0.90
-
-  vocoder:
-    runtime:
-      resources:
-        total_gpu_memory_fraction: 0.08

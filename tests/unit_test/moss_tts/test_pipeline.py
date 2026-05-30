@@ -120,11 +120,6 @@ def make_payload(
 
 
 def test_moss_tts_config_and_registry_contracts() -> None:
-    from sglang_omni.config import (
-        build_process_topology_plan,
-        build_stage_placement_plan,
-    )
-
     config = MossTTSPipelineConfig(model_path="model")
     assert [stage.name for stage in config.stages] == [
         "preprocessing",
@@ -133,26 +128,7 @@ def test_moss_tts_config_and_registry_contracts() -> None:
     ]
     assert config.terminal_stages == ["vocoder"]
     assert config.gpu_placement == {"tts_engine": 0, "vocoder": 0}
-    assert [stage.process for stage in config.stages] == [
-        "preprocessing",
-        "tts_engine",
-        "vocoder",
-    ]
-    assert type(config).talker_role_to_stage() == {"talker": "tts_engine"}
-    assert type(config).code2wav_stage() == "vocoder"
-    memory_fractions = {
-        stage.name: stage.runtime.resources.total_gpu_memory_fraction
-        for stage in config.stages
-    }
-    assert memory_fractions["tts_engine"] == pytest.approx(0.90)
-    assert memory_fractions["vocoder"] == pytest.approx(0.08)
-    placement_plan = build_stage_placement_plan(config)
-    process_plan = build_process_topology_plan(config, placement_plan)
-    assert {group.name for group in process_plan.groups} == {
-        "preprocessing",
-        "tts_engine",
-        "vocoder",
-    }
+    assert {stage.process for stage in config.stages} == {"pipeline"}
     assert (
         PIPELINE_CONFIG_REGISTRY.get_config("MossTTSDelayModel")
         is MossTTSPipelineConfig
