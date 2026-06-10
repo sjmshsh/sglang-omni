@@ -41,17 +41,9 @@ class MossTTSLocalState:
     instructions: str | None = None
     token_count: int | None = None
     generation_kwargs: dict[str, Any] = field(default_factory=dict)
-    # Raw reference waveform loaded by preprocessing for the audio_encoder
-    # stage to GPU-encode. Cleared once the codec produces ``reference_codes``.
-    # ``reference_waveform`` is a 2D float tensor [channels, samples];
-    # ``reference_sample_rate`` is its native rate (resampling is the codec's
-    # responsibility in ``encode_audios_from_wav``).
     reference_waveform: Any | None = None
     reference_sample_rate: int | None = None
-    # File-path reference shipped through to the audio_encoder so the batched
-    # ``encode_audios_from_path`` coalescer can deduplicate concurrent requests.
     reference_audio_path: str | None = None
-    # Output of the audio_encoder stage: codec codes ready for prompt assembly.
     reference_codes: Any | None = None
     audio_codes: Any | None = None
     sample_rate: int = 48000
