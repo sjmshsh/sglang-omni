@@ -286,13 +286,7 @@ def _load_reference_waveform_from_bytes(raw: bytes) -> tuple[torch.Tensor, int]:
 
 
 def _prepare_reference_audio_state(state: MossTTSLocalState) -> None:
-    """CPU-side reference staging.
-
-    Mirrors PR #699's ``_prepare_reference_audio_state`` for moss_tts but
-    also routes a plain file-path reference into ``reference_audio_path``
-    so the audio_encoder's batched ``encode_audios_from_path`` coalescer
-    can deduplicate concurrent encodes.
-    """
+    """CPU-side reference staging."""
     ref_audio = state.ref_audio
     if not isinstance(ref_audio, str):
         return
@@ -303,9 +297,6 @@ def _prepare_reference_audio_state(state: MossTTSLocalState) -> None:
             _load_reference_waveform_from_bytes(raw)
         )
         return
-    # Plain file path — keep ``ref_audio`` populated for the file-path
-    # encode path; ``reference_audio_path`` is the explicit transport
-    # field consumed by the audio_encoder coalescer.
     state.reference_audio_path = ref_audio
 
 

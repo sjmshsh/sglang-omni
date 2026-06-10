@@ -233,16 +233,6 @@ def create_preprocessing_executor(
     *,
     max_concurrency: int = 16,
 ) -> SimpleScheduler:
-    """CPU stage: build state + load base64 reference waveform.
-
-    Mirrors PR #699's slimmed-down moss_tts preprocessing: prompt packing
-    and codec encoding move to ``create_audio_encoder_executor``. Threads
-    release the GIL during base64 decode + soundfile read, so a pool keeps
-    the AR engine fed under bursty client loads.
-
-    ``model_path`` is accepted (and ignored) so the launcher's auto-injection
-    of the global model path stays a no-op for this CPU-only stage.
-    """
     del model_path  # CPU stage, no model assets to load.
     return SimpleScheduler(
         preprocess_moss_tts_local_payload,
@@ -259,16 +249,6 @@ def create_audio_encoder_executor(
     encode_batch_size: int = 8,
     encode_batch_wait_ms: int = 4,
 ) -> SimpleScheduler:
-    """GPU stage: codec-encode the staged reference, then assemble the prompt.
-
-    Threads release the GIL during the codec forward, so a pool keeps the
-    AR engine fed; concurrent file-path references coalesce into batched
-    ``encode_audios_from_path`` calls (the moss_tts_local-only optimization
-    that doesn't apply to upstream moss_tts since it has no path API), while
-    base64 references decode via ``encode_audios_from_wav`` per-request.
-    After encoding, the upstream processor stitches text + audio tokens
-    into the multi-channel prompt rows that the AR scheduler consumes.
-    """
     device = _resolve_codec_device(device, gpu_id)
     processor = _load_moss_tts_local_processor(model_path, device=device)
     reference_encoder = _BatchedReferenceEncoder(

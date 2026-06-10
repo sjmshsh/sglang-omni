@@ -180,7 +180,6 @@ def test_pipeline_stage_wiring():
     for stage in stages.values():
         assert "moss_tts_local" in stage.factory
     assert stages["preprocessing"].process == "pipeline"
-    # Preprocessing is CPU-only after the 4-stage split: no codec_device.
     assert "device" not in (stages["preprocessing"].factory_args or {})
     assert stages["audio_encoder"].process == "pipeline"
     assert stages["audio_encoder"].gpu == 0
@@ -312,11 +311,8 @@ def _payload(text: str = "hello") -> StagePayload:
 def test_preprocess_and_result_adapter():
     set_moss_tts_local_audio_encoder_context(processor=_FakeProcessor())
     try:
-        # Stage 1 (CPU): preprocessing builds state without touching the
-        # processor; the prepared marker is only set by Stage 2.
         pre_payload = preprocess_moss_tts_local_payload(_payload())
         assert pre_payload.data.get("_moss_tts_local_prepared_request") is None
-        # Stage 2 (GPU): codec encode + prompt assembly + handoff publish.
         payload = encode_moss_tts_local_payload(pre_payload)
         assert payload.data.get("_moss_tts_local_prepared_request") == "req-1"
 
