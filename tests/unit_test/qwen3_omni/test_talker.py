@@ -256,6 +256,32 @@ def test_qwen_talker_prefill_keeps_future_rows_device_backed() -> None:
     assert queue[0].device.type == "meta"
 
 
+def test_qwen_talker_prefill_stacks_chunk_rows_after_device_normalization() -> None:
+    """Prevents mixed CPU/CUDA thinker chunks from failing before projection."""
+    builder = object.__new__(TalkerPrefillBuilder)
+    builder._device = torch.device("meta")
+    builder._dtype = torch.float16
+
+    chunks = [
+        SimpleNamespace(
+            data=torch.ones((3,), dtype=torch.float32),
+            metadata={},
+        ),
+        SimpleNamespace(
+            data=torch.zeros((3,), dtype=torch.float32),
+            metadata={
+                "layer_hidden": torch.empty((3,), device="meta", dtype=torch.float32)
+            },
+        ),
+    ]
+
+    rows = builder.stack_chunk_hidden_rows(chunks)
+
+    assert rows.shape == (2, 3)
+    assert rows.device.type == "meta"
+    assert rows.dtype == torch.float16
+
+
 def test_pending_text_queue_rejects_unexpected_rank() -> None:
     """Keeps queue shape handling explicit instead of flattening unknown ranks."""
     queue = PendingTextTensorQueue()

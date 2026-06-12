@@ -195,10 +195,7 @@ class TalkerPrefillBuilder:
 
         assistant_token_ids = self.extract_chunk_token_ids(thinker_chunks)
         assistant_embed = self._load_prompt_token_embeddings(assistant_token_ids)
-        assistant_hidden = torch.stack(
-            [self.chunk_layer_hidden_or_embed(chunk) for chunk in thinker_chunks],
-            dim=0,
-        ).to(device=self._device, dtype=self._dtype)
+        assistant_hidden = self.stack_chunk_hidden_rows(thinker_chunks)
 
         thinker_input_ids = torch.cat([prompt_ids, assistant_token_ids], dim=0)
         thinker_embed = torch.cat([prompt_embed, assistant_embed], dim=0)
@@ -283,6 +280,18 @@ class TalkerPrefillBuilder:
         if isinstance(layer_hidden, torch.Tensor):
             return layer_hidden
         return chunk.data
+
+    def stack_chunk_hidden_rows(self, thinker_chunks: list[Any]) -> torch.Tensor:
+        return torch.stack(
+            [
+                self.chunk_layer_hidden_or_embed(chunk).to(
+                    device=self._device,
+                    dtype=self._dtype,
+                )
+                for chunk in thinker_chunks
+            ],
+            dim=0,
+        )
 
     def project_assistant_chunk(self, chunk: Any) -> torch.Tensor:
         metadata = chunk.metadata or {}
