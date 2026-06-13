@@ -60,6 +60,171 @@ class Zonos2Config(PretrainedConfig):
         super().__init__(**params)
 
 
+def _normalize_special_topk_layers(value: Any) -> dict[int, int] | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("special_topk_layers must be a mapping")
+    normalized: dict[int, int] = {}
+    for layer_idx, topk in value.items():
+        topk_i = int(topk)
+        if topk_i < 1:
+            raise ValueError(
+                f"special_topk_layers[{layer_idx!r}] must be >= 1, got {topk_i}"
+            )
+        normalized[int(layer_idx)] = topk_i
+    return normalized
+
+
+def _normalize_moe_balancing_strategy(strategy: Any) -> str:
+    normalized = str(strategy or "legacy").strip().lower().replace("-", "_")
+    aliases = {
+        "current": "quantile",
+        "quantile": "quantile",
+        "qbalancing": "quantile",
+        "old": "legacy",
+        "legacy": "legacy",
+        "aux": "legacy",
+        "aux_loss": "legacy",
+    }
+    try:
+        return aliases[normalized]
+    except KeyError as exc:
+        raise ValueError(
+            f"Unsupported ZONOS2 moe_balancing_strategy={strategy!r}"
+        ) from exc
+
+
+def _cfg_get(cfg: Any, key: str, default: Any = None) -> Any:
+    if cfg is None:
+        return default
+    if isinstance(cfg, dict):
+        return cfg.get(key, default)
+    return getattr(cfg, key, default)
+
+
+def _load_yaml_config(path: Path) -> Any:
+    try:
+        from omegaconf import OmegaConf
+
+        return OmegaConf.load(path)
+    except ImportError:
+        import yaml
+
+        with path.open(encoding="utf-8") as f:
+            return yaml.safe_load(f)
+
+
+def _conditioned_text_vocab_size(
+    speaking_rate_num_buckets: int,
+    quality_num_buckets: int,
+    speaker_background_num_buckets: int,
+    accurate_mode_num_buckets: int,
+) -> int:
+    return (
+        448
+        + int(speaking_rate_num_buckets)
+        + int(quality_num_buckets)
+        + int(speaker_background_num_buckets)
+        + int(accurate_mode_num_buckets)
+    )
+
+
+def _apply_data_sidecar(model_params: dict[str, Any], data_cfg: Any) -> None:
+    if data_cfg is None:
+        return
+
+    rate_buckets = _cfg_get(data_cfg, "speaking_rate_buckets", None) or []
+    rate_buckets = [str(item) for item in rate_buckets]
+    if rate_buckets:
+        model_params["speaking_rate_buckets"] = rate_buckets
+
+    rate_count = int(model_params.get("speaking_rate_num_buckets") or 0)
+    if bool(_cfg_get(data_cfg, "speaking_rate_enabled", False)):
+        sidecar_rate_count = len(rate_buckets) or int(
+            _cfg_get(data_cfg, "speaking_rate_num_buckets", 0) or 0
+        )
+        if sidecar_rate_count > 0:
+            rate_count = sidecar_rate_count
+            if not int(model_params.get("speaking_rate_num_buckets") or 0):
+                model_params["speaking_rate_num_buckets"] = rate_count
+
+    if bool(_cfg_get(data_cfg, "quality_enabled", False)):
+        raw_features = _cfg_get(data_cfg, "quality_features", None)
+        if hasattr(raw_features, "items"):
+            quality_features = [
+                str(feature)
+                for feature, enabled in raw_features.items()
+                if bool(enabled)
+            ]
+        else:
+            quality_features = [str(item) for item in (raw_features or ())]
+        raw_buckets = _cfg_get(data_cfg, "quality_buckets", None) or {}
+        quality_buckets = {
+            str(feature): [
+                str(item) for item in (raw_buckets.get(feature, None) or ())
+            ]
+            for feature in (quality_features or raw_buckets.keys())
+        }
+        if quality_buckets and "quality_buckets" not in model_params:
+            model_params["quality_buckets"] = quality_buckets
+            model_params["quality_features"] = quality_features or list(
+                quality_buckets.keys()
+            )
+        raw_dropout = _cfg_get(data_cfg, "quality_dropout", None)
+        if raw_dropout is not None and "quality_dropout" not in model_params:
+            if hasattr(raw_dropout, "items"):
+                model_params["quality_dropout"] = {
+                    str(feature): float(dropout)
+                    for feature, dropout in raw_dropout.items()
+                }
+
+    background_enabled = _cfg_get(
+        data_cfg, "speaker_embedding_origin_token_enabled", None
+    )
+    if background_enabled is not None:
+        model_params.setdefault(
+            "speaker_background_token_enabled", bool(background_enabled)
+        )
+    accurate_enabled = _cfg_get(
+        data_cfg, "speaker_embedding_cartesia_clone_source_token_enabled", None
+    )
+    if accurate_enabled is not None:
+        model_params.setdefault("accurate_mode_token_enabled", bool(accurate_enabled))
+
+    if rate_count > 0 and model_params.get("text_vocab") is None:
+        quality_count = sum(
+            len(buckets)
+            for buckets in (model_params.get("quality_buckets") or {}).values()
+        )
+        background_count = (
+            2 if model_params.get("speaker_background_token_enabled") else 0
+        )
+        accurate_count = (
+            1
+            if model_params.get("accurate_mode_token_enabled") and background_count
+            else 0
+        )
+        model_params["text_vocab"] = _conditioned_text_vocab_size(
+            rate_count, quality_count, background_count, accurate_count
+        )
+
+
+def _normalize_zonos2_params(params: dict[str, Any]) -> dict[str, Any]:
+    model_type = params.get("model_type")
+    if model_type is not None and str(model_type) != "zonos2":
+        raise ValueError(f"Unsupported ZONOS2 model_type={model_type!r}")
+    params = dict(params)
+    if "special_topk_layers" in params:
+        params["special_topk_layers"] = _normalize_special_topk_layers(
+            params["special_topk_layers"]
+        )
+    params["moe_balancing_strategy"] = _normalize_moe_balancing_strategy(
+        params.get("moe_balancing_strategy", "legacy")
+    )
+    return params
+
+
 def register_zonos2_hf_config() -> None:
     """Register the local ZONOS2 config class with Transformers."""
 
@@ -70,14 +235,30 @@ def register_zonos2_hf_config() -> None:
 
 
 def load_zonos2_params(checkpoint_dir: str | os.PathLike[str]) -> dict[str, Any]:
-    params_path = Path(checkpoint_dir) / "params.json"
+    checkpoint = Path(checkpoint_dir)
+    params_path = checkpoint / "params.json"
     if not params_path.is_file():
         raise FileNotFoundError(f"ZONOS2 params.json not found under {checkpoint_dir}")
     with params_path.open(encoding="utf-8") as f:
-        params = json.load(f)
-    if not isinstance(params, dict):
+        raw_params = json.load(f)
+    if not isinstance(raw_params, dict):
         raise ValueError(f"ZONOS2 params.json must contain an object: {params_path}")
-    return params
+    params = (
+        raw_params.get("model")
+        if isinstance(raw_params.get("model"), dict)
+        else raw_params
+    )
+    params = dict(params)
+
+    for parent in (checkpoint, checkpoint.parent, checkpoint.parent.parent):
+        config_yaml = parent / "config.yaml"
+        if not config_yaml.is_file():
+            continue
+        cfg = _load_yaml_config(config_yaml)
+        _apply_data_sidecar(params, _cfg_get(cfg, "data", None))
+        break
+
+    return _normalize_zonos2_params(params)
 
 
 def build_zonos2_hf_config_dict(params: dict[str, Any]) -> dict[str, Any]:
@@ -98,7 +279,9 @@ def ensure_zonos2_hf_layout(checkpoint_dir: str | os.PathLike[str]) -> str:
 
     checkpoint = Path(checkpoint_dir).resolve()
     params = load_zonos2_params(checkpoint)
-    digest = hashlib.blake2b(str(checkpoint).encode("utf-8"), digest_size=12).hexdigest()
+    digest = hashlib.blake2b(
+        str(checkpoint).encode("utf-8"), digest_size=12
+    ).hexdigest()
     layout_dir = Path(tempfile.gettempdir()) / "sglang_omni_zonos2" / digest
     layout_dir.mkdir(parents=True, exist_ok=True)
 
@@ -119,11 +302,22 @@ def ensure_zonos2_hf_layout(checkpoint_dir: str | os.PathLike[str]) -> str:
     params_link = layout_dir / "params.json"
     _ensure_link(params_link, checkpoint / "params.json")
 
-    weight_path = checkpoint / "model.pth"
-    if not weight_path.is_file():
-        raise FileNotFoundError(f"ZONOS2 model.pth not found under {checkpoint}")
+    weight_path = _single_file_checkpoint(checkpoint)
+    if weight_path is None:
+        raise FileNotFoundError(
+            f"ZONOS2 weights not found under {checkpoint}; expected model.pth, "
+            "model.pt, or consolidated/consolidated.pth"
+        )
     _ensure_link(layout_dir / "pytorch_model.bin", weight_path)
     return str(layout_dir)
+
+
+def _single_file_checkpoint(checkpoint: Path) -> Path | None:
+    for name in ("model.pth", "model.pt", "consolidated/consolidated.pth"):
+        candidate = checkpoint / name
+        if candidate.is_file():
+            return candidate
+    return None
 
 
 def _ensure_link(link: Path, target: Path) -> None:

@@ -86,9 +86,22 @@ class Zonos2TTSModelRunner(ModelRunner):
             rows = data.prompt_rows
             if rows is None:
                 raise RuntimeError("ZONOS2 prefill requires prompt_rows")
+            if data.output_rows:
+                generated = torch.stack(data.output_rows, dim=0)
+                rows = torch.cat(
+                    [rows.to(device=generated.device), generated], dim=0
+                )
+                data.pending_feedback_queue.clear()
             req_len = int(req.extend_input_len)
             prefix_len = len(req.prefix_indices)
             current_rows = rows[prefix_len : prefix_len + req_len]
+            if int(current_rows.shape[0]) != req_len:
+                raise RuntimeError(
+                    f"ZONOS2 prefill row mismatch for {req.rid}: have "
+                    f"{int(current_rows.shape[0])} rows, need {req_len} "
+                    f"(prefix={prefix_len}, prompt={int(data.prompt_rows.shape[0])}, "
+                    f"generated={len(data.output_rows)})"
+                )
             embeds = self.model._prepare_multi_modal_inputs(
                 current_rows.to(device=forward_batch.input_ids.device)
             )
@@ -125,6 +138,15 @@ class Zonos2TTSModelRunner(ModelRunner):
             return
         embedding = self.model._decode_input_embedding
         weight = embedding.weight
+        if forward_batch.input_ids.numel() < batch_size:
+            raise RuntimeError(
+                "ZONOS2 decode input_ids must contain one row id per request"
+            )
+        if batch_size > int(weight.shape[0]):
+            raise RuntimeError(
+                "ZONOS2 decode batch exceeds the staged decode-embedding rows "
+                f"({batch_size} > {int(weight.shape[0])})"
+            )
 
         rows = []
         for sched_req in requests:
@@ -262,46 +284,44 @@ class Zonos2TTSModelRunner(ModelRunner):
         if audio_pad_id < vocab_size:
             logits[:, :, audio_pad_id:] = float("-inf")
 
-        # Temperature scaling
-        safe_temp = temperatures.clamp(min=1e-8).view(batch_size, 1, 1)
-        scaled_logits = logits / safe_temp
+        # Per-request temperature, top-k, top-p, and min-p are broadcast over
+        # codebooks, then applied as per-row masks. This preserves request
+        # semantics under batching while keeping the work vectorized.
+        do_sample = temperatures > 0
+        safe_temp = torch.where(do_sample, temperatures, torch.ones_like(temperatures))
+        scores = logits.to(torch.float32) / safe_temp.view(batch_size, 1, 1)
 
-        # Flatten for sampling: [batch * n_codebooks, vocab]
-        flat_logits = scaled_logits.view(batch_size * n_codebooks, vocab_size)
+        flat_scores = scores.reshape(batch_size * n_codebooks, vocab_size)
+        flat_top_ks = top_ks.view(batch_size, 1).expand(
+            batch_size, n_codebooks
+        ).reshape(-1)
+        flat_top_ps = top_ps.view(batch_size, 1).expand(
+            batch_size, n_codebooks
+        ).reshape(-1)
+        flat_min_ps = min_ps.view(batch_size, 1).expand(
+            batch_size, n_codebooks
+        ).reshape(-1)
+        flat_greedy = (~do_sample).view(batch_size, 1).expand(
+            batch_size, n_codebooks
+        ).reshape(-1)
 
-        # Apply top-k (use min across batch for efficiency)
-        min_top_k = int(top_ks.min().item())
-        if 0 < min_top_k < vocab_size:
-            values, _ = torch.topk(flat_logits, min_top_k, dim=-1)
-            kth = values[..., -1].unsqueeze(-1)
-            flat_logits = flat_logits.masked_fill(flat_logits < kth, float("-inf"))
-
-        # Softmax to probabilities
-        probs = F.softmax(flat_logits, dim=-1)
-
-        # Apply top-p
-        max_top_p = float(top_ps.max().item())
-        if 0.0 < max_top_p < 1.0:
-            probs = self._apply_top_p(probs, max_top_p)
-
-        # Apply min-p
-        max_min_p = float(min_ps.max().item())
-        if max_min_p > 0.0:
-            probs = self._apply_min_p(probs, max_min_p)
+        flat_scores = self._apply_top_k_scores(flat_scores, flat_top_ks)
+        probs = F.softmax(flat_scores, dim=-1)
+        probs = self._apply_top_p_rows(probs, flat_top_ps)
+        probs = self._apply_min_p_rows(probs, flat_min_ps)
 
         # Handle all-zero rows (fallback to greedy)
         invalid = probs.sum(dim=-1) <= 0
         if bool(invalid.any()):
-            greedy = flat_logits.argmax(dim=-1)
+            greedy = flat_scores.argmax(dim=-1)
             fallback = torch.zeros_like(probs)
             fallback.scatter_(-1, greedy.unsqueeze(-1), 1.0)
             probs = torch.where(invalid.unsqueeze(-1), fallback, probs)
 
         # Sample. Match Zyphra's per-request generator semantics when a seed is
-        # supplied, while still using the batch-level filtering above.
-        greedy_mask = temperatures <= 0
-        if bool(greedy_mask.all()):
-            sampled = flat_logits.argmax(dim=-1)
+        # supplied, while still using the vectorized per-row filtering above.
+        if bool(flat_greedy.all()):
+            sampled = flat_scores.argmax(dim=-1)
         elif any(getattr(d, "seed", None) is not None for d in datas):
             sampled = torch.empty(
                 batch_size * n_codebooks,
@@ -311,8 +331,8 @@ class Zonos2TTSModelRunner(ModelRunner):
             for req_idx, data in enumerate(datas):
                 start = req_idx * n_codebooks
                 end = start + n_codebooks
-                if bool(greedy_mask[req_idx]):
-                    sampled[start:end] = flat_logits[start:end].argmax(dim=-1)
+                if bool(flat_greedy[start]):
+                    sampled[start:end] = flat_scores[start:end].argmax(dim=-1)
                     continue
                 generator = self._get_sampling_generator(data, device)
                 sampled[start:end] = torch.multinomial(
@@ -323,12 +343,12 @@ class Zonos2TTSModelRunner(ModelRunner):
         else:
             sampled = torch.multinomial(probs, num_samples=1).squeeze(-1)
             # Override greedy for zero-temperature requests
-            if bool(greedy_mask.any()):
-                greedy_ids = greedy_mask.nonzero(as_tuple=False).squeeze(-1)
-                for idx in greedy_ids:
-                    start = int(idx) * n_codebooks
-                    end = start + n_codebooks
-                    sampled[start:end] = flat_logits[start:end].argmax(dim=-1)
+            if bool(flat_greedy.any()):
+                sampled = torch.where(
+                    flat_greedy,
+                    flat_scores.argmax(dim=-1),
+                    sampled,
+                )
 
         return sampled.view(batch_size, n_codebooks).to(torch.long)
 
@@ -367,6 +387,55 @@ class Zonos2TTSModelRunner(ModelRunner):
         probs = probs.masked_fill(mask, 0.0)
         probs = probs / probs.sum(dim=-1, keepdim=True).clamp(min=1e-8)
         return probs
+
+    @staticmethod
+    def _apply_top_k_scores(
+        scores: torch.Tensor,
+        top_k_row: torch.Tensor,
+    ) -> torch.Tensor:
+        vocab_size = scores.shape[-1]
+        active = (top_k_row > 0) & (top_k_row < vocab_size)
+        if not bool(active.any()):
+            return scores
+        k_clamped = top_k_row.clamp(min=1, max=vocab_size)
+        max_top_k = int(k_clamped[active].max().item())
+        topk_scores, _ = torch.topk(scores, k=max_top_k, dim=-1)
+        gather_k = torch.where(active, k_clamped, torch.ones_like(k_clamped))
+        kth = topk_scores.gather(1, (gather_k - 1).unsqueeze(1))
+        threshold = torch.where(
+            active.unsqueeze(1), kth, torch.full_like(kth, float("-inf"))
+        )
+        return scores.masked_fill(scores < threshold, float("-inf"))
+
+    @staticmethod
+    def _apply_top_p_rows(
+        probs: torch.Tensor,
+        top_p_row: torch.Tensor,
+    ) -> torch.Tensor:
+        active = (top_p_row > 0.0) & (top_p_row < 1.0)
+        if not bool(active.any()):
+            return probs
+        sorted_probs, sorted_idx = torch.sort(probs, dim=-1, descending=True)
+        cumsum = torch.cumsum(sorted_probs, dim=-1)
+        mask = cumsum - sorted_probs > top_p_row.unsqueeze(1)
+        mask = mask & active.unsqueeze(1)
+        sorted_probs = sorted_probs.masked_fill(mask, 0.0)
+        probs = probs.scatter(-1, sorted_idx, sorted_probs)
+        return probs / probs.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+
+    @staticmethod
+    def _apply_min_p_rows(
+        probs: torch.Tensor,
+        min_p_row: torch.Tensor,
+    ) -> torch.Tensor:
+        active = min_p_row > 0.0
+        if not bool(active.any()):
+            return probs
+        top_probs, _ = probs.max(dim=-1, keepdim=True)
+        mask = probs < (min_p_row.unsqueeze(1) * top_probs)
+        mask = mask & active.unsqueeze(1)
+        probs = probs.masked_fill(mask, 0.0)
+        return probs / probs.sum(dim=-1, keepdim=True).clamp(min=1e-8)
 
     def _apply_repetition_penalty(
         self,
