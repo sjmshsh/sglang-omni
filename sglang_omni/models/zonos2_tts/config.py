@@ -22,11 +22,15 @@ def _codec_gpu(codec_device: str) -> int:
 
 def _stages(
     *,
-    codec_device: str = "cuda:1",
-    speaker_device: str = "cuda:1",
+    codec_device: str = "cuda:0",
+    speaker_device: str = "cuda:0",
 ) -> list[StageConfig]:
     codec_gpu = _codec_gpu(codec_device)
     speaker_gpu = _codec_gpu(speaker_device)
+    speaker_process = "pipeline" if speaker_gpu == 0 else "speaker_encode"
+    vocoder_process = "pipeline" if codec_gpu == 0 else "vocoder"
+    if speaker_gpu == codec_gpu and speaker_gpu != 0:
+        speaker_process = vocoder_process
     return [
         StageConfig(
             name="preprocessing",
@@ -40,7 +44,7 @@ def _stages(
         ),
         StageConfig(
             name="speaker_encode",
-            process="pipeline",
+            process=speaker_process,
             factory=f"{_PKG}.stages.create_speaker_encode_executor",
             factory_args={
                 "device": speaker_device,
@@ -63,10 +67,11 @@ def _stages(
         ),
         StageConfig(
             name="vocoder",
-            process="vocoder",
+            process=vocoder_process,
             factory=f"{_PKG}.stages.create_vocoder_executor",
             factory_args={
                 "device": codec_device,
+                "gpu_id": None,
                 "max_batch_size": 16,
                 "max_batch_frames": 1024,
             },
@@ -104,7 +109,7 @@ class Zonos2TTSPipelineConfig(PipelineConfig):
 
     model_path: str
     stages: list[StageConfig] = Field(
-        default_factory=lambda: _stages(codec_device="cuda:1", speaker_device="cuda:1")
+        default_factory=lambda: _stages(codec_device="cuda:0", speaker_device="cuda:0")
     )
 
 
@@ -116,9 +121,18 @@ class Zonos2TTSColocatedPipelineConfig(Zonos2TTSPipelineConfig):
     )
 
 
+class Zonos2TTSMultiGPUPipelineConfig(Zonos2TTSPipelineConfig):
+    """Two-GPU variant: AR engine on cuda:0, speaker encoder and DAC on cuda:1."""
+
+    stages: list[StageConfig] = Field(
+        default_factory=lambda: _stages(codec_device="cuda:1", speaker_device="cuda:1")
+    )
+
+
 EntryClass = Zonos2TTSPipelineConfig
 
 Variants = {
     "default": Zonos2TTSPipelineConfig,
     "colocated": Zonos2TTSColocatedPipelineConfig,
+    "multi_gpu": Zonos2TTSMultiGPUPipelineConfig,
 }

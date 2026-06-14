@@ -359,10 +359,10 @@ def prepare_dac_codes_for_decode(
 def _resolve_codec_device(device: str | None, gpu_id: int | None) -> str:
     """Pick the DAC device.
 
-    ZONOS2's AR decode loop is the latency-critical path. On two-GPU hosts we
-    keep the DAC vocoder on cuda:1, matching the MOSS-TTS Local serving layout,
-    while the stage remains in the pipeline process. If only one CUDA device is
-    visible, the default cuda:1 placement falls back to cuda:0.
+    Stage placement can inject ``gpu_id`` after CUDA_VISIBLE_DEVICES is scoped
+    for the process, so it takes precedence over the static config device. A
+    static CUDA device still falls back to cuda:0 when only one local device is
+    visible.
     """
     if gpu_id is not None:
         return f"cuda:{int(gpu_id)}"

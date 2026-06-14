@@ -320,6 +320,7 @@ that happened to contain an older version of the test.
   - synchronous frame-decode parity harness and S0 gate coverage.
 
 - `unit_test/zonos2_tts/`: ZONOS2 TTS unit tests:
+  - default colocated and explicit multi-GPU topology contracts
   - byte/conditioning prompt layout, speaker-cache namespace, and preprocessing handoff
   - HF `params.json` / training-sidecar config adaptation
   - multi-codebook sampler row-wise filtering and retraction prefill replay.
