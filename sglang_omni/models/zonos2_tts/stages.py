@@ -167,8 +167,14 @@ def create_sglang_tts_engine_executor(
     *,
     device: str = "cuda:0",
     gpu_id: int | None = None,
+    tp_rank: int = 0,
+    tp_size: int = 1,
+    nccl_port: int | None = None,
     dtype: str = "bfloat16",
     server_args_overrides: dict[str, Any] | None = None,
+    total_gpu_memory_fraction: float | None = None,
+    enable_async_decode: bool = False,
+    async_decode_min_batch_size: int = 2,
 ) -> Any:
     """Create the SGLang-based TTS engine executor.
 
@@ -207,6 +213,7 @@ def create_sglang_tts_engine_executor(
     }
     if server_args_overrides:
         overrides.update(server_args_overrides)
+    overrides["tp_size"] = int(tp_size)
 
     server_args = build_sglang_server_args(
         sglang_checkpoint_dir,
@@ -229,7 +236,10 @@ def create_sglang_tts_engine_executor(
     ) = create_sglang_infrastructure(
         server_args,
         gpu_id,
+        tp_rank=tp_rank,
+        nccl_port=nccl_port,
         model_arch_override="Zonos2SGLangModel",
+        total_gpu_memory_fraction=total_gpu_memory_fraction,
     )
 
     if want_cuda_graph:
@@ -246,6 +256,12 @@ def create_sglang_tts_engine_executor(
     )
     request_builder, result_adapter = make_zonos2_scheduler_adapters(model=model)
 
+    def abort_request(request_id: str) -> None:
+        cleanup_prepared_zonos2_request(request_id)
+        reset_request = getattr(model, "reset_request", None)
+        if reset_request is not None:
+            reset_request(request_id)
+
     return OmniScheduler(
         tp_worker=model_worker,
         tree_cache=tree_cache,
@@ -258,7 +274,9 @@ def create_sglang_tts_engine_executor(
         model_runner=Zonos2TTSModelRunner(model_worker, output_proc),
         request_builder=request_builder,
         result_adapter=result_adapter,
-        abort_callback=cleanup_prepared_zonos2_request,
+        abort_callback=abort_request,
+        enable_async_decode=enable_async_decode,
+        async_decode_min_batch_size=async_decode_min_batch_size,
     )
 
 
@@ -281,6 +299,59 @@ def shear_up(x: torch.Tensor, pad_id: int) -> torch.Tensor:
     return out
 
 
+def _resolve_codec_device(device: str | None, gpu_id: int | None) -> str:
+    """Pick the DAC device.
+
+    ZONOS2's AR decode loop is the latency-critical path. On two-GPU hosts we
+    keep the DAC vocoder on cuda:1, matching the MOSS-TTS Local serving layout,
+    while the stage remains in the pipeline process. If only one CUDA device is
+    visible, the default cuda:1 placement falls back to cuda:0.
+    """
+    if gpu_id is not None:
+        return f"cuda:{int(gpu_id)}"
+    if device:
+        if device.startswith("cuda:") and torch.cuda.is_available():
+            try:
+                index = int(device.split(":", 1)[1])
+            except ValueError:
+                return device
+            if index >= torch.cuda.device_count():
+                logger.info(
+                    "Requested ZONOS2 DAC device %s is not visible; using cuda:0",
+                    device,
+                )
+                return "cuda:0"
+        return device
+    return "cuda:0"
+
+
+def _slice_batched_dac_waveforms(
+    wavs: torch.Tensor,
+    frame_lengths: list[int],
+) -> list[torch.Tensor]:
+    """Trim padded batched DAC output back to each request's code length."""
+    if wavs.ndim == 1:
+        wavs = wavs.view(1, -1)
+    elif wavs.ndim == 3 and wavs.shape[1] == 1:
+        wavs = wavs[:, 0, :]
+    elif wavs.ndim != 2:
+        wavs = wavs.reshape(wavs.shape[0], -1)
+
+    if not frame_lengths:
+        return []
+    max_frames = max(max(int(length), 0) for length in frame_lengths)
+    if max_frames <= 0:
+        return [torch.zeros(1, dtype=torch.float32) for _ in frame_lengths]
+
+    max_samples = int(wavs.shape[-1])
+    trimmed: list[torch.Tensor] = []
+    for wav, frames in zip(wavs, frame_lengths):
+        frames = max(int(frames), 0)
+        samples = max(1, round(max_samples * frames / max_frames))
+        trimmed.append(wav[:samples].contiguous())
+    return trimmed
+
+
 def create_vocoder_executor(
     model_path: str,
     *,
@@ -289,13 +360,13 @@ def create_vocoder_executor(
     dtype: str = "float32",
     max_batch_size: int = 8,
     max_batch_wait_ms: int = 2,
+    max_batch_frames: int | None = None,
 ) -> SimpleScheduler:
     """Create the DAC vocoder stage executor.
 
     Decodes multi-codebook audio codes to PCM waveform at 44.1kHz.
     """
-    if gpu_id is not None:
-        device = f"cuda:{gpu_id}"
+    device = _resolve_codec_device(device, gpu_id)
 
     # Lazy-load DAC model
     _dac_model = None
@@ -321,7 +392,9 @@ def create_vocoder_executor(
     # Pre-load DAC at startup
     _get_dac()
 
-    def _vocode(payload: StagePayload) -> StagePayload:
+    def _prepare_vocoder_item(
+        payload: StagePayload,
+    ) -> tuple[Zonos2TTSState, torch.Tensor | None]:
         state = load_state(payload)
         audio_codes = state.audio_codes
         if audio_codes is None:
@@ -334,7 +407,6 @@ def create_vocoder_executor(
             raise RuntimeError("ZONOS2 generated no audio codes")
 
         # Remove delay pattern
-        n_codebooks = int(state.n_codebooks)
         audio_pad_id = int(state.audio_pad_id)
         codes = audio_codes.to(dtype=torch.long)
 
@@ -346,21 +418,30 @@ def create_vocoder_executor(
             codes = codes[: max(0, state.eos_frame)]
 
         if codes.numel() == 0:
-            # Empty audio - return silence
-            wav = torch.zeros(1, dtype=torch.float32)
-        else:
-            # Clamp to valid codebook range
-            codes = torch.clamp(codes, max=int(state.codebook_size) - 1)
+            return state, None
 
-            # DAC expects (batch, codebooks, seq_len)
-            codes = codes.unsqueeze(0).permute(0, 2, 1).contiguous()
-            codes = codes.to(device=device, dtype=torch.long)
+        # Clamp to valid codebook range
+        codes = torch.clamp(codes, max=int(state.codebook_size) - 1)
+        return state, codes
 
-            dac = _get_dac()
-            with torch.no_grad(), torch.inference_mode():
-                z = dac.quantizer.from_codes(codes)[0]
-                wav = dac.decode(z).float().squeeze(0).squeeze(0).cpu()
+    def _vocoder_request_cost(payload: StagePayload) -> int:
+        """Use generated frame count as DAC batch cost to limit pad waste."""
+        try:
+            state = load_state(payload)
+            audio_codes = state.audio_codes
+            if audio_codes is None:
+                return 0
+            if isinstance(audio_codes, torch.Tensor):
+                return int(audio_codes.shape[0]) if audio_codes.ndim > 0 else 0
+            return int(len(audio_codes))
+        except Exception:
+            return 0
 
+    def _store_vocoder_result(
+        payload: StagePayload,
+        state: Zonos2TTSState,
+        wav: torch.Tensor,
+    ) -> StagePayload:
         # Build output payload
         audio_payload = audio_waveform_payload(wav, source_hint="ZONOS2")
         state.audio_codes = None  # Free memory
@@ -375,11 +456,57 @@ def create_vocoder_executor(
         return payload
 
     def _vocode_batch(payloads: list[StagePayload]) -> list[StagePayload]:
-        return [_vocode(payload) for payload in payloads]
+        prepared = [_prepare_vocoder_item(payload) for payload in payloads]
+        non_empty = [
+            (payload, state, codes)
+            for payload, (state, codes) in zip(payloads, prepared)
+            if codes is not None
+        ]
+        decoded_by_id: dict[int, torch.Tensor] = {}
+        if non_empty:
+            frame_lengths = [int(codes.shape[0]) for _, _, codes in non_empty]
+            max_frames = max(frame_lengths)
+            n_codebooks = max(int(codes.shape[1]) for _, _, codes in non_empty)
+            batch_codes = torch.zeros(
+                (len(non_empty), n_codebooks, max_frames),
+                dtype=torch.long,
+                device=device,
+            )
+            for idx, (_, _, codes) in enumerate(non_empty):
+                frames, codebooks = int(codes.shape[0]), int(codes.shape[1])
+                batch_codes[idx, :codebooks, :frames] = codes.T.to(
+                    device=device,
+                    dtype=torch.long,
+                    non_blocking=True,
+                )
+
+            dac = _get_dac()
+            with torch.no_grad(), torch.inference_mode():
+                z = dac.quantizer.from_codes(batch_codes)[0]
+                wavs = dac.decode(z).float().detach().cpu()
+            trimmed = _slice_batched_dac_waveforms(wavs, frame_lengths)
+            decoded_by_id = {
+                id(payload): wav
+                for (payload, _, _), wav in zip(non_empty, trimmed)
+            }
+
+        results = []
+        for payload, (state, codes) in zip(payloads, prepared):
+            if codes is None:
+                wav = torch.zeros(1, dtype=torch.float32)
+            else:
+                wav = decoded_by_id[id(payload)]
+            results.append(_store_vocoder_result(payload, state, wav))
+        return results
+
+    def _vocode(payload: StagePayload) -> StagePayload:
+        return _vocode_batch([payload])[0]
 
     return SimpleScheduler(
         _vocode,
         batch_compute_fn=_vocode_batch,
         max_batch_size=max_batch_size,
         max_batch_wait_ms=max_batch_wait_ms,
+        request_cost_fn=_vocoder_request_cost,
+        max_batch_cost=max_batch_frames,
     )

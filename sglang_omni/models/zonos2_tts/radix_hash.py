@@ -61,12 +61,56 @@ def poly_row_hash(rows: torch.Tensor) -> torch.Tensor:
     return acc
 
 
+def folded_hash_coefficients(
+    width: int,
+    *,
+    device: torch.device | str,
+    hash_space: int = RADIX_HASH_SPACE,
+) -> torch.Tensor:
+    """Return coefficients for a one-reduction folded row hash.
+
+    The decode loop only needs a stable radix key inside ``hash_space``; it
+    does not need the intermediate M31 polynomial value. Precomputing the
+    polynomial coefficients modulo ``hash_space`` lets the hot path hash a full
+    row with one multiply/sum/remainder instead of one remainder per channel.
+    """
+    if width <= 0:
+        raise ValueError(f"width must be positive, got {width}")
+    base = _BASE % int(hash_space)
+    coeffs = [0] * width
+    power = 1
+    for idx in range(width - 1, -1, -1):
+        coeffs[idx] = power
+        power = (power * base) % int(hash_space)
+    return torch.tensor(coeffs, dtype=torch.int64, device=device)
+
+
+def folded_row_hash(
+    rows: torch.Tensor,
+    coeffs: torch.Tensor,
+    *,
+    hash_space: int = RADIX_HASH_SPACE,
+) -> torch.Tensor:
+    """Fast full-row hash already folded into ``[0, hash_space)``."""
+    if rows.ndim != 2:
+        raise ValueError(f"rows must be 2-D [B, C], got shape {tuple(rows.shape)}")
+    if coeffs.ndim != 1 or int(coeffs.shape[0]) != int(rows.shape[1]):
+        raise ValueError(
+            "coeffs must be 1-D with one coefficient per row channel "
+            f"(got {tuple(coeffs.shape)} for rows {tuple(rows.shape)})"
+        )
+    work = rows.to(torch.int64)
+    folded = (torch.remainder(work, hash_space) * coeffs.view(1, -1)).sum(dim=1)
+    return torch.remainder(folded, hash_space)
+
+
 def gpu_radix_row_hash(
     rows: torch.Tensor,
     eoa_mask: torch.Tensor,
     eoa_id: int,
     *,
     hash_space: int = RADIX_HASH_SPACE,
+    coeffs: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Capture-safe radix token ids for a batch of generated ZONOS2 frames.
 
@@ -82,7 +126,10 @@ def gpu_radix_row_hash(
         ``[0, hash_space)``; EOS rows get the raw ``eoa_id`` so the existing
         eos detection still fires.
     """
-    folded = torch.remainder(poly_row_hash(rows), hash_space)
+    if coeffs is None:
+        folded = torch.remainder(poly_row_hash(rows), hash_space)
+    else:
+        folded = folded_row_hash(rows, coeffs, hash_space=hash_space)
     eoa_val = torch.full_like(folded, eoa_id)
     return torch.where(eoa_mask, eoa_val, folded)
 

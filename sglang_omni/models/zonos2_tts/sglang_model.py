@@ -24,7 +24,6 @@ import torch.nn.functional as F
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import (
-    ParallelLMHead,
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import (
@@ -39,6 +38,7 @@ from sglang_omni.models.zonos2_tts.payload_types import (
     ZONOS2_LOSS_SOFTCAP,
     ZONOS2_N_CODEBOOKS,
 )
+from sglang_omni.models.zonos2_tts.state_pool import Zonos2TTSDecodeStatePool
 from sglang_omni.vendor.sglang.layers import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
@@ -55,6 +55,13 @@ from sglang_omni.vendor.sglang.layers import (
 from sglang_omni.vendor.sglang.utils import add_prefix
 
 logger = logging.getLogger(__name__)
+
+
+def _unwrap_norm_output(output: Any) -> torch.Tensor:
+    """Handle RMSNorm variants that return either a tensor or (tensor, residual)."""
+    if isinstance(output, tuple):
+        return output[0]
+    return output
 
 
 # ============================================================================
@@ -176,7 +183,7 @@ class Zonos2Attention(nn.Module):
         self.attn = RadixAttention(
             self.num_heads_per_tp,
             self.head_dim,
-            1.0,  # scaling handled by QK-norm + temp
+            self.head_dim**-0.5,
             self.num_kv_heads_per_tp,
             layer_id=layer_id,
         )
@@ -208,8 +215,13 @@ class Zonos2Attention(nn.Module):
         q = F.rms_norm(q, (self.head_dim,), eps=1e-6) * self.temp.abs().to(q.dtype)
         k = F.rms_norm(k, (self.head_dim,), eps=1e-6)
 
-        # Apply RoPE
-        q, k = self.rotary_emb(forward_batch.positions, q, k)
+        # ZONOS2 applies interleaved RoPE on flattened head dimensions.
+        q, k = self.rotary_emb(
+            forward_batch.positions,
+            q.flatten(-2),
+            k.flatten(-2),
+        )
+        q = q.view(-1, self.num_heads_per_tp, self.head_dim)
 
         # Attention with paged KV cache
         attn_output = self.attn(q, k, v, forward_batch)
@@ -355,7 +367,7 @@ class Zonos2Router(nn.Module):
         router_states_next = h.clone()
 
         # Normalize
-        h, _ = self.rmsnorm_eda(h)
+        h = _unwrap_norm_output(self.rmsnorm_eda(h))
 
         # Router MLP
         h = F.gelu(self.router_mlp_0(h))
@@ -520,7 +532,7 @@ class Zonos2DecoderLayer(nn.Module):
         # Pre-attention norm with residual
         if residual is None:
             residual = hidden_states
-            hidden_states, _ = self.attention_norm(hidden_states)
+            hidden_states = _unwrap_norm_output(self.attention_norm(hidden_states))
         else:
             hidden_states, residual = self.attention_norm(hidden_states, residual)
 
@@ -600,10 +612,12 @@ class Zonos2SGLangModel(nn.Module):
                 )
             )
 
-        # Embedding norm (non-affine RMSNorm in ZONOS2)
-        self.emb_norm = RMSNorm(self.hidden_size, eps=self.config.rms_norm_eps)
-        if hasattr(self.emb_norm, "weight"):
-            self.emb_norm.weight.data.fill_(1.0)
+        # Embedding norm is non-affine in the reference implementation.
+        self.emb_norm = RMSNorm(
+            self.hidden_size,
+            eps=self.config.rms_norm_eps,
+            has_weight=False,
+        )
 
         # Speaker projection (optional, for voice cloning)
         speaker_enabled = bool(getattr(self.config, "speaker_enabled", False))
@@ -646,11 +660,11 @@ class Zonos2SGLangModel(nn.Module):
         # Output norm
         self.out_norm = RMSNorm(self.hidden_size, eps=self.config.rms_norm_eps)
 
-        # Multi-output head: projects hidden_size -> n_codebooks * audio_vocab
-        self.multi_output_head = ParallelLMHead(
-            num_embeddings=self.n_codebooks * self.audio_vocab,
-            embedding_dim=self.hidden_size,
-            prefix=add_prefix("multi_output", prefix),
+        # Multi-output head: exact checkpoint projection, not a padded LM vocab head.
+        self.multi_output_head = nn.Linear(
+            self.hidden_size,
+            self.n_codebooks * self.audio_vocab,
+            bias=False,
         )
 
         # Decode-time input embedding (rewritten each step by model_runner)
@@ -660,10 +674,18 @@ class Zonos2SGLangModel(nn.Module):
             max_batch_size = get_global_server_args().max_running_requests
         except Exception:
             pass
-        self._decode_input_embedding = nn.Embedding(
-            max_batch_size, self.hidden_size
-        )
+        self._decode_input_embedding = nn.Embedding(max_batch_size, self.hidden_size)
         self._decode_input_embedding.weight.requires_grad_(False)
+        self._state_pool = (
+            Zonos2TTSDecodeStatePool(self)
+            if bool(getattr(self.config, "enable_decode_state_pool", False))
+            else None
+        )
+
+    def reset_request(self, rid: str) -> None:
+        """Release decode-state pool state for a finished or aborted request."""
+        if self._state_pool is not None:
+            self._state_pool.release_row(rid)
 
     @staticmethod
     def _normalize_config(config: Any) -> Any:
@@ -787,8 +809,7 @@ class Zonos2SGLangModel(nn.Module):
 
     def _apply_emb_norm(self, x: torch.Tensor) -> torch.Tensor:
         """Apply embedding RMSNorm. Used by model_runner for prefill/decode."""
-        normed, _ = self.emb_norm(x)
-        return normed
+        return _unwrap_norm_output(self.emb_norm(x))
 
     @torch.no_grad()
     def project_speaker_embedding(self, speaker_embedding: torch.Tensor) -> torch.Tensor:
@@ -850,7 +871,7 @@ class Zonos2SGLangModel(nn.Module):
         )
         for idx, embed_layer in enumerate(self.embedding_list):
             col_ids = input_ids_2d[:, idx].contiguous()
-            embeds = embeds + embed_layer(col_ids)
+            embeds.add_(embed_layer(col_ids))
 
         return embeds
 
@@ -879,7 +900,7 @@ class Zonos2SGLangModel(nn.Module):
                 input_embeds = self._prepare_multi_modal_inputs(input_ids)
 
         # Apply embedding norm (non-affine)
-        hidden_states, _ = self.emb_norm(input_embeds)
+        hidden_states = _unwrap_norm_output(self.emb_norm(input_embeds))
 
         # Run transformer layers
         residual = None
@@ -918,7 +939,7 @@ class Zonos2SGLangModel(nn.Module):
         Returns:
             logits: [batch_size, n_codebooks, audio_vocab] with soft-capping applied
         """
-        logits = F.linear(hidden_states, self.multi_output_head.weight)
+        logits = self.multi_output_head(hidden_states)
         batch_size = logits.shape[0]
         logits = logits.view(batch_size, self.n_codebooks, self.audio_vocab)
 
@@ -1019,10 +1040,7 @@ class Zonos2SGLangModel(nn.Module):
 
             # === Embedding norm (non-affine, skip) ===
             if name == "emb_norm.weight":
-                # ZONOS2 uses non-affine emb_norm; but our RMSNorm has weight
-                if "emb_norm.weight" in params_dict:
-                    self._load_param(params_dict["emb_norm.weight"], loaded_weight)
-                    loaded_count += 1
+                skipped_count += 1
                 continue
 
             # === Speaker projection ===
@@ -1153,7 +1171,13 @@ class Zonos2SGLangModel(nn.Module):
         if ".attention.temp" in name and not name.endswith(".weight"):
             mapped = name  # layers.{N}.attention.temp
             if mapped in params_dict:
-                params_dict[mapped].data.copy_(loaded_weight)
+                param = params_dict[mapped]
+                if param.shape != loaded_weight.shape and loaded_weight.dim() == 3:
+                    tp_rank = get_attention_tp_rank()
+                    per_rank = param.shape[1]
+                    start = tp_rank * per_rank
+                    loaded_weight = loaded_weight[:, start : start + per_rank, :]
+                param.data.copy_(loaded_weight)
                 return True
             return False
 
@@ -1243,18 +1267,15 @@ class Zonos2SGLangModel(nn.Module):
 
         if name.endswith(".feed_forward.experts.w1.weight") and w13_key in params_dict:
             param = params_dict[w13_key]
-            param.weight_loader(param, loaded_weight, name, shard_id="w1")
-            return True
+            return self._load_packed_moe_experts(param, loaded_weight, name, "w1")
 
         if name.endswith(".feed_forward.experts.w3.weight") and w13_key in params_dict:
             param = params_dict[w13_key]
-            param.weight_loader(param, loaded_weight, name, shard_id="w3")
-            return True
+            return self._load_packed_moe_experts(param, loaded_weight, name, "w3")
 
         if name.endswith(".feed_forward.experts.w2.weight") and w2_key in params_dict:
             param = params_dict[w2_key]
-            param.weight_loader(param, loaded_weight, name, shard_id="w2")
-            return True
+            return self._load_packed_moe_experts(param, loaded_weight, name, "w2")
 
         # SonicMoE stores w13 interleaved as gate/up alternating rows.
         if (name.endswith(".feed_forward.experts.w13") or ".experts.w13" in name) and w13_key in params_dict:
@@ -1263,14 +1284,14 @@ class Zonos2SGLangModel(nn.Module):
             gate = loaded_weight[:, 0::2, :].contiguous()
             up = loaded_weight[:, 1::2, :].contiguous()
             param = params_dict[w13_key]
-            param.weight_loader(param, gate, name, shard_id="w1")
-            param.weight_loader(param, up, name, shard_id="w3")
-            return True
+            return (
+                self._load_packed_moe_experts(param, gate, name, "w1")
+                and self._load_packed_moe_experts(param, up, name, "w3")
+            )
 
         if (name.endswith(".feed_forward.experts.w2") or ".experts.w2" in name) and w2_key in params_dict:
             param = params_dict[w2_key]
-            param.weight_loader(param, loaded_weight, name, shard_id="w2")
-            return True
+            return self._load_packed_moe_experts(param, loaded_weight, name, "w2")
 
         from sglang_omni.models.qwen3_omni.components.thinker_model import (
             extract_fused_experts,
@@ -1313,6 +1334,27 @@ class Zonos2SGLangModel(nn.Module):
             return True
 
         return False
+
+    def _load_packed_moe_experts(
+        self,
+        param: torch.nn.Parameter,
+        loaded_weight: torch.Tensor,
+        name: str,
+        shard_id: str,
+    ) -> bool:
+        num_experts = int(self.config.moe_n_experts)
+        if loaded_weight.dim() < 3 or int(loaded_weight.shape[0]) != num_experts:
+            return False
+        weight_name = name if "weight" in name else f"{name}.weight"
+        for expert_id, expert_weight in enumerate(loaded_weight.unbind(dim=0)):
+            param.weight_loader(
+                param,
+                expert_weight.contiguous(),
+                weight_name,
+                shard_id=shard_id,
+                expert_id=expert_id,
+            )
+        return True
 
     @staticmethod
     def _load_param(param: torch.nn.Parameter, loaded_weight: torch.Tensor) -> None:

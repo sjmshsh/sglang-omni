@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 
 from sglang_omni.models.zonos2_tts.hf_config import (
+    build_zonos2_hf_config_dict,
     ensure_zonos2_hf_layout,
     load_zonos2_params,
 )
@@ -58,6 +59,14 @@ def test_load_zonos2_params_supports_nested_model_and_data_sidecar(tmp_path) -> 
     assert params["text_vocab"] == 455
     assert params["special_topk_layers"] == {1: 2}
     assert params["moe_balancing_strategy"] == "quantile"
+
+
+def test_hf_config_enables_decode_state_pool() -> None:
+    config = build_zonos2_hf_config_dict(
+        {"model_type": "zonos2", "dim": 128, "n_layers": 2}
+    )
+
+    assert config["enable_decode_state_pool"] is True
 
 
 def test_ensure_zonos2_hf_layout_accepts_model_pt(tmp_path) -> None:

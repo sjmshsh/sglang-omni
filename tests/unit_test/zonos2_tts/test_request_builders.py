@@ -6,6 +6,7 @@ import sys
 import types
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from sglang_omni.models.zonos2_tts import request_builders as rb
@@ -79,6 +80,7 @@ def test_generation_defaults_ignore_openai_s2_sampling_defaults() -> None:
             "temperature": 0.8,
             "top_p": 0.8,
             "top_k": 30,
+            "min_p": 0.0,
             "repetition_penalty": 1.1,
         },
         tts_params={"explicit_generation_params": []},
@@ -87,6 +89,7 @@ def test_generation_defaults_ignore_openai_s2_sampling_defaults() -> None:
     assert gen["temperature"] == rb.ZONOS2_DEFAULT_TEMPERATURE
     assert gen["top_p"] == rb.ZONOS2_DEFAULT_TOP_P
     assert gen["top_k"] == rb.ZONOS2_DEFAULT_TOP_K
+    assert gen["min_p"] == rb.ZONOS2_DEFAULT_MIN_P
     assert gen["repetition_penalty"] == rb.ZONOS2_DEFAULT_REPETITION_PENALTY
 
 
@@ -99,6 +102,60 @@ def test_generation_explicit_sampling_overrides_defaults() -> None:
     assert gen["temperature"] == 0.7
     assert gen["top_k"] == 25
     assert gen["seed"] == 123
+
+
+def test_generation_defaults_leave_max_tokens_unset_until_prompt_budget() -> None:
+    gen = rb.build_generation_kwargs({}, tts_params={})
+
+    assert "max_new_tokens" not in gen
+
+
+def test_generation_budget_defaults_to_remaining_context() -> None:
+    model = SimpleNamespace(config=SimpleNamespace(max_position_embeddings=6144))
+
+    resolved = rb.resolve_zonos2_max_new_tokens(
+        model=model,
+        prompt_len=37,
+        requested=None,
+    )
+
+    assert resolved == 6107
+
+
+def test_generation_budget_respects_explicit_user_cap() -> None:
+    gen = rb.build_generation_kwargs(
+        {"max_new_tokens": 1024},
+        tts_params={"explicit_generation_params": ["max_new_tokens"]},
+    )
+    model = SimpleNamespace(config=SimpleNamespace(max_position_embeddings=6144))
+
+    resolved = rb.resolve_zonos2_max_new_tokens(
+        model=model,
+        prompt_len=37,
+        requested=gen["max_new_tokens"],
+    )
+
+    assert resolved == 1024
+
+
+def test_generation_budget_clamps_explicit_cap_to_context() -> None:
+    model = SimpleNamespace(config=SimpleNamespace(max_position_embeddings=2048))
+
+    resolved = rb.resolve_zonos2_max_new_tokens(
+        model=model,
+        prompt_len=100,
+        requested=4096,
+    )
+
+    assert resolved == 1948
+
+
+def test_generation_budget_rejects_non_positive_user_cap() -> None:
+    with pytest.raises(ValueError, match="max_new_tokens"):
+        rb.build_generation_kwargs(
+            {"max_new_tokens": 0},
+            tts_params={"explicit_generation_params": ["max_new_tokens"]},
+        )
 
 
 def test_preprocessing_uses_prepared_store_without_tensor_payload() -> None:

@@ -266,6 +266,7 @@ def build_zonos2_hf_config_dict(params: dict[str, Any]) -> dict[str, Any]:
     data = cfg.to_dict()
     data["model_type"] = Zonos2Config.model_type
     data["architectures"] = ["Zonos2SGLangModel"]
+    data["enable_decode_state_pool"] = True
     return data
 
 

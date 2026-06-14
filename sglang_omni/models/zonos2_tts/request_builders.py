@@ -39,7 +39,6 @@ from sglang_omni.scheduling.types import ARRequestData
 
 logger = logging.getLogger(__name__)
 
-ZONOS2_DEFAULT_MAX_NEW_TOKENS = 1024
 ZONOS2_DEFAULT_TEMPERATURE = 1.15
 ZONOS2_DEFAULT_TOP_K = 106
 ZONOS2_DEFAULT_TOP_P = 0.0
@@ -49,6 +48,7 @@ ZONOS2_DEFAULT_REPETITION_WINDOW = 50
 ZONOS2_DEFAULT_REPETITION_CODEBOOKS = 8
 
 _ZONOS2_PREPARED_MARKER = "_zonos2_tts_prepared_request"
+_ZONOS2_PREPARED_DATA = "_zonos2_tts_prepared_data"
 _DATA_URI_RE = re.compile(r"^data:[^;,]+;base64,(?P<data>.+)$", re.DOTALL)
 _SPEAKING_RATE_CLOSED_BUCKET_RE = re.compile(
     r"^\s*(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)\s*$"
@@ -82,6 +82,7 @@ _IMPLICIT_SAMPLING_DEFAULTS = {
     "temperature": {0.8, 1.0},
     "top_p": {0.8, 1.0},
     "top_k": {30, -1},
+    "min_p": {0.0},
     "repetition_penalty": {1.0, 1.1},
 }
 
@@ -414,7 +415,7 @@ class Zonos2TTSSGLangRequestData(ARRequestData):
     repetition_penalty: float = ZONOS2_DEFAULT_REPETITION_PENALTY
     repetition_window: int = ZONOS2_DEFAULT_REPETITION_WINDOW
     repetition_codebooks: int = ZONOS2_DEFAULT_REPETITION_CODEBOOKS
-    max_new_tokens: int = ZONOS2_DEFAULT_MAX_NEW_TOKENS
+    max_new_tokens: int = 0
     seed: int | None = None
     ignore_eos: bool = False
     eos_frame: int = -1
@@ -501,12 +502,60 @@ def pop_prepared_zonos2_request(payload: StagePayload) -> Zonos2PreparedRequest:
         raise RuntimeError("ZONOS2 request is missing preprocessing marker")
     with _PREPARED_REQUESTS_LOCK:
         prepared = _PREPARED_REQUESTS.pop(prepared_request_id, None)
+    if prepared is None and isinstance(payload.data, dict):
+        prepared = _prepared_request_from_payload(payload.data)
     if prepared is None:
         raise RuntimeError(
             "ZONOS2 preprocessing state is missing for prepared payload "
             f"{prepared_request_id!r}"
         )
     return prepared
+
+
+def _prepared_request_to_payload(prepared: Zonos2PreparedRequest) -> dict[str, Any]:
+    data: dict[str, Any] = {
+        "prompt_rows": prepared.prompt_rows.detach().cpu(),
+        "input_ids_list": list(prepared.input_ids_list),
+        "speaker_token_position": int(prepared.speaker_token_position),
+        "speaker_cache_key": prepared.speaker_cache_key,
+        "generation_kwargs": dict(prepared.generation_kwargs),
+    }
+    if prepared.speaker_embedding is not None:
+        data["speaker_embedding"] = prepared.speaker_embedding.detach().cpu()
+    return data
+
+
+def _prepared_request_from_payload(data: dict[str, Any]) -> Zonos2PreparedRequest | None:
+    prepared_data = data.get(_ZONOS2_PREPARED_DATA)
+    if not isinstance(prepared_data, dict):
+        return None
+
+    prompt_rows = prepared_data.get("prompt_rows")
+    if prompt_rows is None:
+        return None
+    prompt_rows = torch.as_tensor(prompt_rows, dtype=torch.long)
+
+    input_ids = prepared_data.get("input_ids_list")
+    if input_ids is None:
+        input_ids = build_row_cache_key_ids(prompt_rows)
+
+    speaker_embedding = prepared_data.get("speaker_embedding")
+    if speaker_embedding is not None:
+        speaker_embedding = torch.as_tensor(speaker_embedding, dtype=torch.float32)
+
+    generation_kwargs = prepared_data.get("generation_kwargs")
+    if not isinstance(generation_kwargs, dict):
+        generation_kwargs = dict(Zonos2TTSState.from_dict(data).generation_kwargs)
+
+    return Zonos2PreparedRequest(
+        state=Zonos2TTSState.from_dict(data),
+        prompt_rows=prompt_rows,
+        input_ids_list=[int(x) for x in input_ids],
+        speaker_embedding=speaker_embedding,
+        speaker_token_position=int(prepared_data.get("speaker_token_position", -1)),
+        speaker_cache_key=prepared_data.get("speaker_cache_key"),
+        generation_kwargs=dict(generation_kwargs),
+    )
 
 
 def cleanup_prepared_zonos2_request(request_id: str | StagePayload) -> None:
@@ -638,7 +687,7 @@ def build_zonos2_state(payload: StagePayload) -> Zonos2TTSState:
             data.get("language"),
         )
     )
-    state = Zonos2TTSState(
+    return Zonos2TTSState(
         text=text,
         ref_audio=ref_audio,
         ref_text=_resolve_optional_text(
@@ -647,7 +696,6 @@ def build_zonos2_state(payload: StagePayload) -> Zonos2TTSState:
         language=language,
         generation_kwargs=build_generation_kwargs(params, tts_params=tts_params),
     )
-    return state
 
 
 def _explicit_generation_fields(tts_params: dict[str, Any]) -> set[str]:
@@ -696,7 +744,6 @@ def build_generation_kwargs(
 ) -> dict[str, Any]:
     explicit_fields = _explicit_generation_fields(tts_params)
     generation: dict[str, Any] = {
-        "max_new_tokens": ZONOS2_DEFAULT_MAX_NEW_TOKENS,
         "temperature": ZONOS2_DEFAULT_TEMPERATURE,
         "top_k": ZONOS2_DEFAULT_TOP_K,
         "top_p": ZONOS2_DEFAULT_TOP_P,
@@ -720,7 +767,11 @@ def build_generation_kwargs(
             continue
         generation[canonical] = value
 
-    generation["max_new_tokens"] = max(1, int(generation["max_new_tokens"]))
+    if "max_new_tokens" in generation:
+        max_new_tokens = int(generation["max_new_tokens"])
+        if max_new_tokens <= 0:
+            raise ValueError("ZONOS2 max_new_tokens must be positive")
+        generation["max_new_tokens"] = max_new_tokens
     generation["temperature"] = float(generation["temperature"])
     generation["top_k"] = int(generation["top_k"])
     generation["top_p"] = float(generation["top_p"])
@@ -732,6 +783,53 @@ def build_generation_kwargs(
     if generation["seed"] is not None:
         generation["seed"] = _normalize_seed(generation["seed"])
     return generation
+
+
+def _model_tts_max_tokens(model: Any) -> int:
+    config = getattr(model, "config", model)
+    rotary_config = getattr(config, "rotary_config", None)
+    candidates = (
+        getattr(model, "max_seq_len", None),
+        getattr(model, "max_position_embeddings", None),
+        getattr(config, "max_seq_len", None),
+        getattr(config, "max_position_embeddings", None),
+        getattr(config, "max_seqlen", None),
+        getattr(rotary_config, "max_position", None),
+    )
+    for candidate in candidates:
+        if candidate is not None:
+            return max(1, int(candidate))
+    return 4096
+
+
+def resolve_zonos2_max_new_tokens(
+    *,
+    model: Any,
+    prompt_len: int,
+    requested: Any,
+) -> int:
+    """Resolve the output budget with the same boundary as upstream ZONOS2.
+
+    The API layer keeps an omitted max token budget as ``None``. The scheduler
+    then converts it to the remaining model context after the frame prompt is
+    known, while explicit user caps are still respected.
+    """
+
+    model_max = _model_tts_max_tokens(model)
+    prompt_len = int(prompt_len)
+    if prompt_len >= model_max:
+        raise ValueError(
+            f"ZONOS2 prompt length {prompt_len} exceeds model context {model_max}"
+        )
+
+    max_output_len = max(1, model_max - prompt_len)
+    if requested is None:
+        return max_output_len
+
+    requested = int(requested)
+    if requested <= 0:
+        raise ValueError("ZONOS2 max_new_tokens must be positive")
+    return min(requested, max_output_len)
 
 
 def _normalize_seed(seed: Any) -> int:
@@ -1307,6 +1405,7 @@ def preprocess_zonos2_tts_payload(payload: StagePayload) -> StagePayload:
         _PREPARED_REQUESTS[payload.request_id] = prepared
     data = prepared.state.to_dict()
     data[_ZONOS2_PREPARED_MARKER] = payload.request_id
+    data[_ZONOS2_PREPARED_DATA] = _prepared_request_to_payload(prepared)
     return StagePayload(
         request_id=payload.request_id,
         request=payload.request,
@@ -1327,7 +1426,12 @@ def make_zonos2_scheduler_adapters(*, model: Any) -> tuple[Any, Any]:
         from sglang.srt.sampling.sampling_params import SamplingParams
         from sglang_omni.models.zonos2_tts.radix_hash import RADIX_HASH_SPACE
 
-        max_new_tokens = int(gen.get("max_new_tokens", ZONOS2_DEFAULT_MAX_NEW_TOKENS))
+        prompt_len = int(prepared.prompt_rows.shape[0])
+        max_new_tokens = resolve_zonos2_max_new_tokens(
+            model=model,
+            prompt_len=prompt_len,
+            requested=gen.get("max_new_tokens"),
+        )
         sampling_params = SamplingParams(
             max_new_tokens=max_new_tokens,
             temperature=0.0,
@@ -1374,7 +1478,7 @@ def make_zonos2_scheduler_adapters(*, model: Any) -> tuple[Any, Any]:
         )
         req_data.input_ids = torch.tensor(prepared.input_ids_list, dtype=torch.long)
         req_data.input_embeds_are_projected = True
-        req_data.prompt_len = int(prepared.prompt_rows.shape[0])
+        req_data.prompt_len = prompt_len
         req_data.max_output_len = max_new_tokens
         return req_data
 
@@ -1392,6 +1496,9 @@ def make_zonos2_scheduler_adapters(*, model: Any) -> tuple[Any, Any]:
         if req_data.engine_start_s > 0:
             state.engine_time_s = time.time() - req_data.engine_start_s
         payload.data = state.to_dict()
+        reset_request = getattr(model, "reset_request", None)
+        if reset_request is not None and req_data.req is not None:
+            reset_request(req_data.req.rid)
         return payload
 
     return request_builder, result_adapter
