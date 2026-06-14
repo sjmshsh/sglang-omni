@@ -20,8 +20,13 @@ def _codec_gpu(codec_device: str) -> int:
     return 0
 
 
-def _stages(*, codec_device: str = "cuda:1") -> list[StageConfig]:
+def _stages(
+    *,
+    codec_device: str = "cuda:1",
+    speaker_device: str = "cuda:1",
+) -> list[StageConfig]:
     codec_gpu = _codec_gpu(codec_device)
+    speaker_gpu = _codec_gpu(speaker_device)
     return [
         StageConfig(
             name="preprocessing",
@@ -31,6 +36,17 @@ def _stages(*, codec_device: str = "cuda:1") -> list[StageConfig]:
                 "device": "cpu",
                 "load_speaker_model": False,
             },
+            next="speaker_encode",
+        ),
+        StageConfig(
+            name="speaker_encode",
+            process="pipeline",
+            factory=f"{_PKG}.stages.create_speaker_encode_executor",
+            factory_args={
+                "device": speaker_device,
+                "max_concurrency": 4,
+            },
+            gpu=speaker_gpu,
             next="tts_engine",
         ),
         StageConfig(
@@ -61,7 +77,7 @@ def _stages(*, codec_device: str = "cuda:1") -> list[StageConfig]:
 
 
 class Zonos2TTSPipelineConfig(PipelineConfig):
-    """ZONOS2 TTS pipeline: preprocessing -> MoE AR engine -> DAC vocoder."""
+    """ZONOS2 TTS pipeline: preprocessing -> speaker -> AR engine -> DAC."""
 
     architecture: ClassVar[str] = "Zonos2ForCausalLM"
     architecture_aliases: ClassVar[tuple[str, ...]] = (
@@ -88,7 +104,7 @@ class Zonos2TTSPipelineConfig(PipelineConfig):
 
     model_path: str
     stages: list[StageConfig] = Field(
-        default_factory=lambda: _stages(codec_device="cuda:1")
+        default_factory=lambda: _stages(codec_device="cuda:1", speaker_device="cuda:1")
     )
 
 
@@ -96,7 +112,7 @@ class Zonos2TTSColocatedPipelineConfig(Zonos2TTSPipelineConfig):
     """Single-GPU variant that colocates the DAC vocoder with the AR engine."""
 
     stages: list[StageConfig] = Field(
-        default_factory=lambda: _stages(codec_device="cuda:0")
+        default_factory=lambda: _stages(codec_device="cuda:0", speaker_device="cuda:0")
     )
 
 

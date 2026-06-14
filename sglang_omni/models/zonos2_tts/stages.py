@@ -27,6 +27,7 @@ from sglang_omni.models.zonos2_tts.payload_types import (
 )
 from sglang_omni.models.zonos2_tts.request_builders import (
     cleanup_prepared_zonos2_request,
+    encode_zonos2_speaker_payload,
     make_zonos2_scheduler_adapters,
     preprocess_zonos2_tts_payload,
     set_zonos2_preprocessing_context,
@@ -39,7 +40,7 @@ logger = logging.getLogger(__name__)
 
 _ZONOS2_INSTALL_HINT = (
     "ZONOS2 TTS requires the 'dac' package for audio decoding. "
-    "Install with: pip install descript-audio-codec"
+    "Install with: pip install descript-audio-codec==1.0.0"
 )
 
 
@@ -140,14 +141,11 @@ def create_preprocessing_executor(
     checkpoint_dir = _resolve_checkpoint(model_path)
     model_config = _load_zonos2_model_config(checkpoint_dir)
 
-    speaker_model = None
-    if load_speaker_model:
-        speaker_device = device if device != "cpu" else "cpu"
-        speaker_model = _load_speaker_model(speaker_device)
+    del device, load_speaker_model
 
     set_zonos2_preprocessing_context(
         model_config=model_config,
-        speaker_model=speaker_model,
+        speaker_model=None,
     )
 
     return SimpleScheduler(
@@ -158,7 +156,41 @@ def create_preprocessing_executor(
 
 
 # ============================================================================
-# Stage 2: TTS Engine (MoE AR backbone)
+# Stage 2: Speaker Encoding
+# ============================================================================
+
+
+def create_speaker_encode_executor(
+    model_path: str,
+    *,
+    device: str = "cuda:0",
+    max_concurrency: int = 4,
+    load_speaker_model: bool = True,
+    **_: Any,
+) -> SimpleScheduler:
+    """Create the optional speaker embedding stage."""
+
+    checkpoint_dir = _resolve_checkpoint(model_path)
+    model_config = _load_zonos2_model_config(checkpoint_dir)
+    speaker_model = _load_speaker_model(device) if load_speaker_model else None
+
+    set_zonos2_preprocessing_context(
+        model_config=model_config,
+        speaker_model=None,
+    )
+
+    def _speaker(payload: StagePayload) -> StagePayload:
+        return encode_zonos2_speaker_payload(payload, speaker_model=speaker_model)
+
+    return SimpleScheduler(
+        _speaker,
+        abort_callback=cleanup_prepared_zonos2_request,
+        max_concurrency=max_concurrency,
+    )
+
+
+# ============================================================================
+# Stage 3: TTS Engine (MoE AR backbone)
 # ============================================================================
 
 
@@ -281,7 +313,7 @@ def create_sglang_tts_engine_executor(
 
 
 # ============================================================================
-# Stage 3: Vocoder (DAC decode -> PCM @ 44.1kHz)
+# Stage 4: Vocoder (DAC decode -> PCM @ 44.1kHz)
 # ============================================================================
 
 
@@ -297,6 +329,31 @@ def shear_up(x: torch.Tensor, pad_id: int) -> torch.Tensor:
         if H > j:
             out[..., : H - j, j] = x[..., j:, j]
     return out
+
+
+def prepare_dac_codes_for_decode(
+    audio_codes: torch.Tensor,
+    *,
+    n_codebooks: int,
+    audio_pad_id: int,
+    codebook_size: int,
+    eos_frame: int | None,
+) -> torch.Tensor | None:
+    codes = torch.as_tensor(audio_codes, dtype=torch.long)
+    if codes.ndim != 2:
+        raise RuntimeError(
+            f"ZONOS2 audio_codes must be [T, C], got {tuple(codes.shape)}"
+        )
+
+    codes = shear_up(codes, int(audio_pad_id))
+    valid_frames = max(0, int(codes.shape[0]) - (int(n_codebooks) - 1))
+    if eos_frame is not None and int(eos_frame) >= 0:
+        valid_frames = min(valid_frames, max(0, int(eos_frame)))
+    if valid_frames <= 0:
+        return None
+
+    codes = codes[:valid_frames]
+    return torch.clamp(codes, max=int(codebook_size) - 1)
 
 
 def _resolve_codec_device(device: str | None, gpu_id: int | None) -> str:
@@ -406,23 +463,16 @@ def create_vocoder_executor(
         if audio_codes.numel() == 0:
             raise RuntimeError("ZONOS2 generated no audio codes")
 
-        # Remove delay pattern
-        audio_pad_id = int(state.audio_pad_id)
-        codes = audio_codes.to(dtype=torch.long)
-
-        # Apply shear_up to remove delay
-        codes = shear_up(codes, audio_pad_id)
-
-        # Trim to EOS frame if detected
-        if state.eos_frame is not None and state.eos_frame >= 0:
-            codes = codes[: max(0, state.eos_frame)]
-
-        if codes.numel() == 0:
-            return state, None
-
-        # Clamp to valid codebook range
-        codes = torch.clamp(codes, max=int(state.codebook_size) - 1)
-        return state, codes
+        return (
+            state,
+            prepare_dac_codes_for_decode(
+                audio_codes,
+                n_codebooks=state.n_codebooks,
+                audio_pad_id=state.audio_pad_id,
+                codebook_size=state.codebook_size,
+                eos_frame=state.eos_frame,
+            ),
+        )
 
     def _vocoder_request_cost(payload: StagePayload) -> int:
         """Use generated frame count as DAC batch cost to limit pad waste."""

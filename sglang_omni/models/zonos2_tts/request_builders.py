@@ -31,9 +31,14 @@ from sglang_omni.models.zonos2_tts.payload_types import (
     ZONOS2_EOS_ID,
     ZONOS2_LEGACY_SYMBOL_VOCAB,
     ZONOS2_N_CODEBOOKS,
+    ZONOS2_TEXT_VOCAB,
     Zonos2TTSState,
 )
 from sglang_omni.models.zonos2_tts.radix_hash import build_row_cache_key_ids
+from sglang_omni.models.zonos2_tts.text_normalization import (
+    normalize_zonos2_language,
+    normalize_zonos2_text,
+)
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.types import ARRequestData
 
@@ -46,6 +51,9 @@ ZONOS2_DEFAULT_MIN_P = 0.18
 ZONOS2_DEFAULT_REPETITION_PENALTY = 1.2
 ZONOS2_DEFAULT_REPETITION_WINDOW = 50
 ZONOS2_DEFAULT_REPETITION_CODEBOOKS = 8
+ZONOS2_DURATION_SAFETY_FRAMES_PER_UTF8_BYTE = 24
+ZONOS2_DURATION_SAFETY_MARGIN_FRAMES = 384
+ZONOS2_DURATION_SAFETY_MIN_FRAMES = 512
 
 _ZONOS2_PREPARED_MARKER = "_zonos2_tts_prepared_request"
 _ZONOS2_PREPARED_DATA = "_zonos2_tts_prepared_data"
@@ -272,7 +280,7 @@ def build_text_prompt_rows(
     *,
     n_codebooks: int = ZONOS2_N_CODEBOOKS,
     audio_pad_id: int = ZONOS2_AUDIO_PAD_ID,
-    text_vocab: int = ZONOS2_BYTE_TEXT_VOCAB,
+    text_vocab: int = ZONOS2_TEXT_VOCAB,
     speaking_rate_num_buckets: int = 0,
     speaking_rate_bucket: int | None = None,
     quality_bucket_counts: Any = (),
@@ -368,7 +376,7 @@ def shear(x: torch.Tensor, pad: int) -> torch.Tensor:
 def build_silence_prefix(
     n_codebooks: int = ZONOS2_N_CODEBOOKS,
     audio_pad_id: int = ZONOS2_AUDIO_PAD_ID,
-    text_vocab: int = ZONOS2_BYTE_TEXT_VOCAB,
+    text_vocab: int = ZONOS2_TEXT_VOCAB,
 ) -> torch.Tensor:
     silence = torch.tensor(_SILENCE_TOKENS_0_2S, dtype=torch.int32)
     sheared = shear(silence[:, :n_codebooks], audio_pad_id)
@@ -590,6 +598,20 @@ def _resolve_optional_text(value: Any) -> str | None:
     return text if text else None
 
 
+def _resolve_bool(value: Any, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+    return bool(value)
+
+
 def _extract_text(inputs: Any, params: dict[str, Any], data: dict[str, Any]) -> str:
     if isinstance(inputs, str):
         return inputs
@@ -680,12 +702,21 @@ def build_zonos2_state(payload: StagePayload) -> Zonos2TTSState:
 
     text = _extract_text(inputs, params, data)
     ref_audio = _extract_reference_audio(inputs, params, tts_params, data)
-    language = _resolve_optional_text(
+    language = normalize_zonos2_language(
         _first_present(
             tts_params.get("language"),
             params.get("language"),
             data.get("language"),
+            "en_us",
         )
+    )
+    text_normalization = _resolve_bool(
+        _first_present(
+            tts_params.get("text_normalization"),
+            params.get("text_normalization"),
+            data.get("text_normalization"),
+        ),
+        True,
     )
     return Zonos2TTSState(
         text=text,
@@ -694,6 +725,7 @@ def build_zonos2_state(payload: StagePayload) -> Zonos2TTSState:
             _first_present(tts_params.get("ref_text"), params.get("ref_text"), data.get("ref_text"))
         ),
         language=language,
+        text_normalization=text_normalization,
         generation_kwargs=build_generation_kwargs(params, tts_params=tts_params),
     )
 
@@ -799,7 +831,7 @@ def _model_tts_max_tokens(model: Any) -> int:
     for candidate in candidates:
         if candidate is not None:
             return max(1, int(candidate))
-    return 4096
+    return 6144
 
 
 def resolve_zonos2_max_new_tokens(
@@ -830,6 +862,35 @@ def resolve_zonos2_max_new_tokens(
     if requested <= 0:
         raise ValueError("ZONOS2 max_new_tokens must be positive")
     return min(requested, max_output_len)
+
+
+def estimate_zonos2_duration_safety_frames(text: str) -> int:
+    """Return a conservative frame budget for stock ZONOS2 TTS requests.
+
+    The value is a safety limit, not a duration target. It leaves normal speech
+    well below the cap, but prevents a missed EOA token from turning a short
+    sentence into minutes of repeated audio until the model context is exhausted.
+    """
+
+    byte_len = max(len((text or "").encode("utf-8")), 1)
+    estimated = (
+        byte_len * ZONOS2_DURATION_SAFETY_FRAMES_PER_UTF8_BYTE
+        + ZONOS2_DURATION_SAFETY_MARGIN_FRAMES
+    )
+    return max(ZONOS2_DURATION_SAFETY_MIN_FRAMES, int(estimated))
+
+
+def apply_zonos2_duration_safety_limit(
+    max_new_tokens: int,
+    *,
+    text: str,
+    requested: Any,
+) -> int:
+    """Bound omitted max_new_tokens by an input-conditioned TTS safety limit."""
+
+    if requested is not None:
+        return int(max_new_tokens)
+    return min(int(max_new_tokens), estimate_zonos2_duration_safety_frames(text))
 
 
 def _normalize_seed(seed: Any) -> int:
@@ -1252,6 +1313,102 @@ def _speaker_embedding_fingerprint(embedding: torch.Tensor | None) -> str | None
     return f"speaker:{digest}"
 
 
+def _store_prepared_zonos2_request(
+    payload: StagePayload,
+    prepared: Zonos2PreparedRequest,
+) -> StagePayload:
+    with _PREPARED_REQUESTS_LOCK:
+        _PREPARED_REQUESTS[payload.request_id] = prepared
+    data = prepared.state.to_dict()
+    data[_ZONOS2_PREPARED_MARKER] = payload.request_id
+    data[_ZONOS2_PREPARED_DATA] = _prepared_request_to_payload(prepared)
+    return StagePayload(
+        request_id=payload.request_id,
+        request=payload.request,
+        data=data,
+    )
+
+
+def _speaker_prefix_rows(
+    payload: StagePayload,
+    state: Zonos2TTSState,
+    model_config: Any,
+) -> list[torch.Tensor]:
+    (
+        _,
+        _,
+        clean_background,
+        accurate_mode,
+    ) = _extract_conditioning_controls(payload, model_config)
+    speaking_rate_num_buckets = int(
+        _get_model_attr(model_config, "speaking_rate_num_buckets", 0) or 0
+    )
+    quality_bucket_counts = _model_quality_bucket_counts(model_config)
+    speaker_background_num_buckets = (
+        2
+        if bool(_get_model_attr(model_config, "speaker_background_token_enabled", False))
+        else 0
+    )
+    accurate_mode_num_buckets = (
+        1
+        if (
+            speaker_background_num_buckets
+            and bool(_get_model_attr(model_config, "accurate_mode_token_enabled", False))
+        )
+        else 0
+    )
+
+    rows = [
+        build_speaker_slot(
+            n_codebooks=state.n_codebooks,
+            audio_pad_id=state.audio_pad_id,
+            text_vocab=state.text_vocab,
+        )
+    ]
+    if speaker_background_num_buckets:
+        background_token = speaker_background_token_id(
+            state.text_vocab,
+            speaking_rate_num_buckets,
+            quality_bucket_counts,
+            clean_background,
+            speaker_background_num_buckets,
+            accurate_mode_num_buckets,
+        )
+        rows.append(
+            torch.tensor(
+                [
+                    _text_row(
+                        background_token,
+                        n_codebooks=state.n_codebooks,
+                        audio_pad_id=state.audio_pad_id,
+                    )
+                ],
+                dtype=torch.long,
+            )
+        )
+    if accurate_mode_num_buckets and accurate_mode:
+        accurate_token = accurate_mode_token_id(
+            state.text_vocab,
+            speaking_rate_num_buckets,
+            quality_bucket_counts,
+            speaker_background_num_buckets,
+            accurate_mode_num_buckets,
+        )
+        rows.append(
+            torch.tensor(
+                [
+                    _text_row(
+                        accurate_token,
+                        n_codebooks=state.n_codebooks,
+                        audio_pad_id=state.audio_pad_id,
+                    )
+                ],
+                dtype=torch.long,
+            )
+        )
+    return rows
+
+
 # ============================================================================
 # Preprocessing and scheduler adapters
 # ============================================================================
@@ -1268,37 +1425,11 @@ def _prepare_zonos2_request(payload: StagePayload) -> Zonos2PreparedRequest:
     state.audio_pad_id = int(_get_model_attr(model_config, "audio_pad_id", state.audio_pad_id))
     state.text_vocab = int(_get_model_attr(model_config, "text_vocab", state.text_vocab))
 
-    params = _as_dict(payload.request.params)
-    metadata = _as_dict(payload.request.metadata)
-    tts_params = _as_dict(metadata.get("tts_params"))
-    data = _as_dict(payload.data)
-    expected_speaker_dim = (
-        int(_get_model_attr(model_config, "speaker_embedding_dim", 0) or 0) or None
-    )
-    direct_embedding = _extract_direct_speaker_embedding(
-        payload.request.inputs,
-        params,
-        tts_params,
-        data,
-        expected_dim=expected_speaker_dim,
-    )
-
-    speaker_embedding = direct_embedding
-    if speaker_embedding is None and state.ref_audio is not None and ctx.speaker_model is not None:
-        try:
-            speaker_embedding = _compute_speaker_embedding(
-                speaker_model=ctx.speaker_model,
-                ref_audio=state.ref_audio,
-                expected_dim=expected_speaker_dim,
-            )
-        except Exception as exc:
-            logger.warning("Failed to extract ZONOS2 speaker embedding: %s", exc)
-
     (
         speaking_rate_bucket,
         quality_buckets,
-        clean_background,
-        accurate_mode,
+        _,
+        _,
     ) = _extract_conditioning_controls(payload, model_config)
 
     state.speaking_rate_bucket = speaking_rate_bucket
@@ -1321,8 +1452,15 @@ def _prepare_zonos2_request(payload: StagePayload) -> Zonos2PreparedRequest:
         else 0
     )
 
-    prompt_rows = build_text_prompt_rows(
+    prompt_text = normalize_zonos2_text(
         state.text,
+        language=state.language,
+        enabled=state.text_normalization,
+    )
+    state.text = prompt_text
+
+    prompt_rows = build_text_prompt_rows(
+        prompt_text,
         n_codebooks=state.n_codebooks,
         audio_pad_id=state.audio_pad_id,
         text_vocab=state.text_vocab,
@@ -1335,53 +1473,12 @@ def _prepare_zonos2_request(payload: StagePayload) -> Zonos2PreparedRequest:
     )
     prompt_tensor = torch.tensor(prompt_rows, dtype=torch.long)
 
-    speaker_token_position = -1
-    prefix_rows: list[torch.Tensor] = []
-    if speaker_embedding is not None and bool(_get_model_attr(model_config, "speaker_enabled", False)):
-        speaker_token_position = 0
-        prefix_rows.append(
-            build_speaker_slot(
-                n_codebooks=state.n_codebooks,
-                audio_pad_id=state.audio_pad_id,
-                text_vocab=state.text_vocab,
-            )
-        )
-        if speaker_background_num_buckets:
-            background_token = speaker_background_token_id(
-                state.text_vocab,
-                speaking_rate_num_buckets,
-                quality_bucket_counts,
-                clean_background,
-                speaker_background_num_buckets,
-                accurate_mode_num_buckets,
-            )
-            prefix_rows.append(
-                torch.tensor(
-                    [_text_row(background_token, n_codebooks=state.n_codebooks, audio_pad_id=state.audio_pad_id)],
-                    dtype=torch.long,
-                )
-            )
-        if accurate_mode_num_buckets and accurate_mode:
-            accurate_token = accurate_mode_token_id(
-                state.text_vocab,
-                speaking_rate_num_buckets,
-                quality_bucket_counts,
-                speaker_background_num_buckets,
-                accurate_mode_num_buckets,
-            )
-            prefix_rows.append(
-                torch.tensor(
-                    [_text_row(accurate_token, n_codebooks=state.n_codebooks, audio_pad_id=state.audio_pad_id)],
-                    dtype=torch.long,
-                )
-            )
-
     silence = build_silence_prefix(
         state.n_codebooks,
         state.audio_pad_id,
         state.text_vocab,
     ).to(dtype=torch.long)
-    all_rows = [*prefix_rows, prompt_tensor, silence]
+    all_rows = [prompt_tensor, silence]
     prompt_tensor = torch.cat(all_rows, dim=0)
 
     state.prompt_tokens = int(prompt_tensor.shape[0])
@@ -1390,9 +1487,9 @@ def _prepare_zonos2_request(payload: StagePayload) -> Zonos2PreparedRequest:
         state=state,
         prompt_rows=prompt_tensor,
         input_ids_list=input_ids_list,
-        speaker_embedding=speaker_embedding,
-        speaker_token_position=speaker_token_position,
-        speaker_cache_key=_speaker_embedding_fingerprint(speaker_embedding),
+        speaker_embedding=None,
+        speaker_token_position=-1,
+        speaker_cache_key=None,
         generation_kwargs=dict(state.generation_kwargs),
     )
 
@@ -1401,16 +1498,67 @@ def preprocess_zonos2_tts_payload(payload: StagePayload) -> StagePayload:
     """Preprocess a ZONOS2 TTS request outside the AR scheduler."""
 
     prepared = _prepare_zonos2_request(payload)
-    with _PREPARED_REQUESTS_LOCK:
-        _PREPARED_REQUESTS[payload.request_id] = prepared
-    data = prepared.state.to_dict()
-    data[_ZONOS2_PREPARED_MARKER] = payload.request_id
-    data[_ZONOS2_PREPARED_DATA] = _prepared_request_to_payload(prepared)
-    return StagePayload(
-        request_id=payload.request_id,
-        request=payload.request,
-        data=data,
-    )
+    return _store_prepared_zonos2_request(payload, prepared)
+
+
+def encode_zonos2_speaker_payload(
+    payload: StagePayload,
+    *,
+    speaker_model: Any = None,
+) -> StagePayload:
+    """Attach optional direct/ref-audio speaker embedding after preprocessing."""
+
+    ctx = get_zonos2_preprocessing_context()
+    model_config = ctx.model_config
+    prepared = pop_prepared_zonos2_request(payload)
+    state = prepared.state
+
+    speaker_embedding = prepared.speaker_embedding
+    if speaker_embedding is None:
+        params = _as_dict(payload.request.params)
+        metadata = _as_dict(payload.request.metadata)
+        tts_params = _as_dict(metadata.get("tts_params"))
+        data = _as_dict(payload.data)
+        expected_speaker_dim = (
+            int(_get_model_attr(model_config, "speaker_embedding_dim", 0) or 0)
+            or None
+        )
+        speaker_embedding = _extract_direct_speaker_embedding(
+            payload.request.inputs,
+            params,
+            tts_params,
+            data,
+            expected_dim=expected_speaker_dim,
+        )
+        if (
+            speaker_embedding is None
+            and state.ref_audio is not None
+            and speaker_model is not None
+        ):
+            try:
+                speaker_embedding = _compute_speaker_embedding(
+                    speaker_model=speaker_model,
+                    ref_audio=state.ref_audio,
+                    expected_dim=expected_speaker_dim,
+                )
+            except Exception as exc:
+                logger.warning("Failed to extract ZONOS2 speaker embedding: %s", exc)
+
+    if (
+        speaker_embedding is not None
+        and prepared.speaker_token_position < 0
+        and bool(_get_model_attr(model_config, "speaker_enabled", False))
+    ):
+        prefix_rows = _speaker_prefix_rows(payload, state, model_config)
+        prepared.prompt_rows = torch.cat([*prefix_rows, prepared.prompt_rows], dim=0)
+        prepared.input_ids_list = build_row_cache_key_ids(prepared.prompt_rows)
+        prepared.speaker_token_position = 0
+        state.prompt_tokens = int(prepared.prompt_rows.shape[0])
+
+    prepared.speaker_embedding = speaker_embedding
+    prepared.speaker_cache_key = _speaker_embedding_fingerprint(speaker_embedding)
+    prepared.state = state
+    return _store_prepared_zonos2_request(payload, prepared)
 
 
 def make_zonos2_scheduler_adapters(*, model: Any) -> tuple[Any, Any]:
@@ -1427,10 +1575,16 @@ def make_zonos2_scheduler_adapters(*, model: Any) -> tuple[Any, Any]:
         from sglang_omni.models.zonos2_tts.radix_hash import RADIX_HASH_SPACE
 
         prompt_len = int(prepared.prompt_rows.shape[0])
+        requested_max_new_tokens = gen.get("max_new_tokens")
         max_new_tokens = resolve_zonos2_max_new_tokens(
             model=model,
             prompt_len=prompt_len,
-            requested=gen.get("max_new_tokens"),
+            requested=requested_max_new_tokens,
+        )
+        max_new_tokens = apply_zonos2_duration_safety_limit(
+            max_new_tokens,
+            text=prepared.state.text,
+            requested=requested_max_new_tokens,
         )
         sampling_params = SamplingParams(
             max_new_tokens=max_new_tokens,

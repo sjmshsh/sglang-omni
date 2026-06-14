@@ -12,52 +12,139 @@ from typing import Any
 
 from transformers import AutoConfig, PretrainedConfig
 
+ARCHITECTURE = "Zonos2SGLangModel"
+
+
+def _round_ffn(dim: int, multiplier: float, multiple_of: int) -> int:
+    hidden = int(dim * multiplier)
+    return multiple_of * ((hidden + multiple_of - 1) // multiple_of)
+
 
 class Zonos2Config(PretrainedConfig):
-    """Minimal HF config wrapper around ZONOS2's native ``params.json``."""
+    """HF-style config for ZONOS2's native ``params.json``."""
 
     model_type = "zonos2"
 
-    def __init__(self, **kwargs: Any) -> None:
-        params = dict(kwargs)
-        if "dim" in params and "hidden_size" not in params:
-            params["hidden_size"] = int(params["dim"])
-        if "n_layers" in params and "num_hidden_layers" not in params:
-            params["num_hidden_layers"] = int(params["n_layers"])
+    def __init__(
+        self,
+        *,
+        n_layers: int = 28,
+        dim: int = 2048,
+        head_dim: int = 128,
+        n_heads: int | None = None,
+        n_kv_heads: int = 4,
+        ffn_dim_multiplier: float = 1.5,
+        multiple_of: int = 256,
+        norm_eps: float = 1e-5,
+        rope_theta: float = 10000.0,
+        max_seqlen: int = 6144,
+        dtype: str = "bfloat16",
+        n_codebooks: int = 9,
+        codebook_size: int = 1024,
+        eoa_id: int = 1024,
+        audio_pad_id: int = 1025,
+        text_vocab: int = 519,
+        loss_softcap: float = 15.0,
+        speaker_enabled: bool = True,
+        speaker_embedding_dim: int = 2048,
+        speaker_lda_dim: int = 1024,
+        speaker_background_token_enabled: bool = True,
+        accurate_mode_token_enabled: bool = True,
+        speaking_rate_num_buckets: int = 8,
+        speaking_rate_buckets: list[str] | None = None,
+        quality_num_buckets: int = 60,
+        quality_features: list[str] | None = None,
+        quality_buckets: dict[str, list[str]] | None = None,
+        moe_impl: str = "sonic",
+        moe_n_experts: int = 16,
+        moe_router_topk: int = 1,
+        special_topk_layers: dict[str, int] | None = None,
+        moe_router_dim: int = 128,
+        moe_start_from_layer: int = 3,
+        moe_end_from_layer: int = 1,
+        moe_balancing_strategy: str | None = None,
+        **kwargs: Any,
+    ) -> None:
+        hidden_size = kwargs.pop("hidden_size", None)
+        if hidden_size is not None and dim == 2048:
+            dim = int(hidden_size)
+        num_hidden_layers = kwargs.pop("num_hidden_layers", None)
+        if num_hidden_layers is not None and n_layers == 28:
+            n_layers = int(num_hidden_layers)
+        num_attention_heads = kwargs.pop("num_attention_heads", None)
+        if num_attention_heads is not None and n_heads is None:
+            n_heads = int(num_attention_heads)
+        num_key_value_heads = kwargs.pop("num_key_value_heads", None)
+        if num_key_value_heads is not None and n_kv_heads == 4:
+            n_kv_heads = int(num_key_value_heads)
+        max_position_embeddings = kwargs.pop("max_position_embeddings", None)
+        if max_position_embeddings is not None and max_seqlen == 6144:
+            max_seqlen = int(max_position_embeddings)
+        rms_norm_eps = kwargs.pop("rms_norm_eps", None)
+        if rms_norm_eps is not None and norm_eps == 1e-5:
+            norm_eps = float(rms_norm_eps)
 
-        hidden_size = int(params.get("hidden_size", 2048))
-        head_dim = int(params.get("head_dim", 128))
-        n_heads = params.get("n_heads")
-        if n_heads is None:
-            n_heads = hidden_size // head_dim
-        params.setdefault("num_attention_heads", int(n_heads))
-        params.setdefault("num_key_value_heads", int(params.get("n_kv_heads", n_heads)))
+        intermediate_size = kwargs.pop("intermediate_size", None)
+        self.n_layers = n_layers
+        self.dim = dim
+        self.head_dim = head_dim
+        self.n_heads = n_heads if n_heads else dim // head_dim
+        self.n_kv_heads = n_kv_heads
+        self.ffn_dim_multiplier = ffn_dim_multiplier
+        self.multiple_of = multiple_of
+        self.norm_eps = norm_eps
+        self.rope_theta = rope_theta
+        self.max_seqlen = max_seqlen
+        self.zonos_dtype = dtype
 
-        if "intermediate_size" not in params:
-            multiplier = float(params.get("ffn_dim_multiplier", 4.0))
-            multiple_of = int(params.get("multiple_of", 256))
-            raw_intermediate = int(multiplier * hidden_size)
-            params["intermediate_size"] = (
-                multiple_of
-                * ((raw_intermediate + multiple_of - 1) // multiple_of)
-            )
+        self.n_codebooks = n_codebooks
+        self.codebook_size = codebook_size
+        self.eoa_id = eoa_id
+        self.audio_pad_id = audio_pad_id
+        self.audio_vocab = codebook_size + 2
+        self.text_vocab = text_vocab
+        self.loss_softcap = loss_softcap
 
-        params.setdefault("rms_norm_eps", float(params.get("norm_eps", 1e-5)))
-        params.setdefault(
-            "max_position_embeddings", int(params.get("max_seqlen", 4096))
+        self.speaker_enabled = speaker_enabled
+        self.speaker_embedding_dim = speaker_embedding_dim
+        self.speaker_lda_dim = speaker_lda_dim
+        self.speaker_background_token_enabled = speaker_background_token_enabled
+        self.accurate_mode_token_enabled = accurate_mode_token_enabled
+
+        self.speaking_rate_num_buckets = speaking_rate_num_buckets
+        self.speaking_rate_buckets = speaking_rate_buckets or []
+        self.quality_num_buckets = quality_num_buckets
+        self.quality_features = quality_features or []
+        self.quality_buckets = quality_buckets or {}
+
+        self.moe_impl = moe_impl
+        self.moe_n_experts = moe_n_experts
+        self.moe_router_topk = moe_router_topk
+        self.special_topk_layers = {
+            int(k): int(v) for k, v in (special_topk_layers or {}).items()
+        }
+        self.moe_router_dim = moe_router_dim
+        self.moe_start_from_layer = moe_start_from_layer
+        self.moe_end_from_layer = moe_end_from_layer
+        self.moe_balancing_strategy = moe_balancing_strategy
+
+        self.intermediate_size = (
+            int(intermediate_size)
+            if intermediate_size is not None
+            else _round_ffn(dim, ffn_dim_multiplier, multiple_of)
         )
-        params.setdefault("rope_theta", float(params.get("rope_theta", 10000.0)))
 
-        codebook_size = int(params.get("codebook_size", 1024))
-        n_codebooks = int(params.get("n_codebooks", 9))
-        text_vocab = params.get("text_vocab")
-        vocab_size = n_codebooks * (codebook_size + 2)
-        if text_vocab is not None:
-            vocab_size += int(text_vocab) + 1
-        params.setdefault("vocab_size", vocab_size)
+        self.hidden_size = dim
+        self.num_hidden_layers = n_layers
+        self.num_attention_heads = self.n_heads
+        self.num_key_value_heads = n_kv_heads
+        self.max_position_embeddings = max_seqlen
+        self.rms_norm_eps = norm_eps
+        self.vocab_size = self.audio_vocab
 
-        params.setdefault("architectures", ["Zonos2SGLangModel"])
-        super().__init__(**params)
+        kwargs.pop("vocab_size", None)
+        kwargs.setdefault("architectures", [ARCHITECTURE])
+        super().__init__(**kwargs)
 
 
 def _normalize_special_topk_layers(value: Any) -> dict[int, int] | None:
@@ -265,7 +352,7 @@ def build_zonos2_hf_config_dict(params: dict[str, Any]) -> dict[str, Any]:
     cfg = Zonos2Config(**params)
     data = cfg.to_dict()
     data["model_type"] = Zonos2Config.model_type
-    data["architectures"] = ["Zonos2SGLangModel"]
+    data["architectures"] = [ARCHITECTURE]
     data["enable_decode_state_pool"] = True
     return data
 

@@ -37,7 +37,7 @@ def load_dac_model(device: str = "cuda:0") -> None:
     except ImportError:
         raise RuntimeError(
             "ZONOS2 TTS requires the 'dac' package. "
-            "Install with: pip install descript-audio-codec"
+            "Install with: pip install descript-audio-codec==1.0.0"
         )
 
 

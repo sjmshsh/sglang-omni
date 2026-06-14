@@ -14,6 +14,7 @@ ZONOS2_EOA_ID = 1024  # End-of-audio token
 ZONOS2_AUDIO_PAD_ID = 1025  # Audio padding token
 ZONOS2_SAMPLE_RATE = 44100  # DAC 44kHz output
 ZONOS2_LOSS_SOFTCAP = 15.0
+ZONOS2_TEXT_VOCAB = 519
 
 # Text tokenization constants (UTF-8 byte encoding)
 ZONOS2_LEGACY_SYMBOL_VOCAB = 192
@@ -31,6 +32,7 @@ class Zonos2TTSState:
     ref_audio: Any | None = None
     ref_text: str | None = None
     language: str | None = None
+    text_normalization: bool = True
     speaker_embedding: Any | None = None
 
     # Generation parameters
@@ -41,7 +43,7 @@ class Zonos2TTSState:
     codebook_size: int = ZONOS2_CODEBOOK_SIZE
     eoa_id: int = ZONOS2_EOA_ID
     audio_pad_id: int = ZONOS2_AUDIO_PAD_ID
-    text_vocab: int = ZONOS2_BYTE_TEXT_VOCAB
+    text_vocab: int = ZONOS2_TEXT_VOCAB
     speaking_rate_bucket: int | None = None
     quality_buckets: list[int | None] | None = None
 
@@ -68,6 +70,7 @@ class Zonos2TTSState:
     def to_dict(self) -> dict[str, Any]:
         data: dict[str, Any] = {
             "text": self.text,
+            "text_normalization": bool(self.text_normalization),
             "generation_kwargs": dict(self.generation_kwargs),
             "sample_rate": int(self.sample_rate),
             "n_codebooks": int(self.n_codebooks),
@@ -112,6 +115,7 @@ class Zonos2TTSState:
             ref_audio=data.get("ref_audio"),
             ref_text=data.get("ref_text"),
             language=data.get("language"),
+            text_normalization=bool(data.get("text_normalization", True)),
             speaker_embedding=data.get("speaker_embedding"),
             generation_kwargs=(
                 dict(generation_kwargs) if isinstance(generation_kwargs, dict) else {}
@@ -120,7 +124,7 @@ class Zonos2TTSState:
             codebook_size=int(data.get("codebook_size", ZONOS2_CODEBOOK_SIZE)),
             eoa_id=int(data.get("eoa_id", ZONOS2_EOA_ID)),
             audio_pad_id=int(data.get("audio_pad_id", ZONOS2_AUDIO_PAD_ID)),
-            text_vocab=int(data.get("text_vocab", ZONOS2_BYTE_TEXT_VOCAB)),
+            text_vocab=int(data.get("text_vocab", ZONOS2_TEXT_VOCAB)),
             speaking_rate_bucket=data.get("speaking_rate_bucket"),
             quality_buckets=data.get("quality_buckets"),
             audio_codes=data.get("audio_codes"),

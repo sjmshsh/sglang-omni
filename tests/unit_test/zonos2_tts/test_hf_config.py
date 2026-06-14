@@ -69,6 +69,17 @@ def test_hf_config_enables_decode_state_pool() -> None:
     assert config["enable_decode_state_pool"] is True
 
 
+def test_hf_config_defaults_match_zonos2_checkpoint_shape() -> None:
+    config = build_zonos2_hf_config_dict({"model_type": "zonos2"})
+
+    assert config["text_vocab"] == 519
+    assert config["max_position_embeddings"] == 6144
+    assert config["intermediate_size"] == 3072
+    assert config["speaker_enabled"] is True
+    assert config["moe_n_experts"] == 16
+    assert config["moe_router_topk"] == 1
+
+
 def test_ensure_zonos2_hf_layout_accepts_model_pt(tmp_path) -> None:
     ckpt = tmp_path / "checkpoint"
     ckpt.mkdir()

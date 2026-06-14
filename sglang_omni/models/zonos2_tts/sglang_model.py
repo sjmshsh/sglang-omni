@@ -37,6 +37,7 @@ from sglang_omni.models.zonos2_tts.payload_types import (
     ZONOS2_EOA_ID,
     ZONOS2_LOSS_SOFTCAP,
     ZONOS2_N_CODEBOOKS,
+    ZONOS2_TEXT_VOCAB,
 )
 from sglang_omni.models.zonos2_tts.state_pool import Zonos2TTSDecodeStatePool
 from sglang_omni.vendor.sglang.layers import (
@@ -724,7 +725,7 @@ class Zonos2SGLangModel(nn.Module):
         head_dim = int(getattr(config, "head_dim", hidden_size // num_qo_heads))
         raw_intermediate = getattr(config, "intermediate_size", None)
         if raw_intermediate is None:
-            multiplier = float(getattr(config, "ffn_dim_multiplier", 4.0))
+            multiplier = float(getattr(config, "ffn_dim_multiplier", 1.5))
             multiple_of = int(getattr(config, "multiple_of", 256))
             raw_size = int(multiplier * hidden_size)
             raw_intermediate = multiple_of * (
@@ -734,7 +735,7 @@ class Zonos2SGLangModel(nn.Module):
         rms_norm_eps = float(getattr(config, "rms_norm_eps", getattr(config, "norm_eps", 1e-5)))
         rope_theta = float(getattr(config, "rope_theta", 10000.0))
         max_position = int(
-            getattr(config, "max_position_embeddings", getattr(config, "max_seqlen", 4096))
+            getattr(config, "max_position_embeddings", getattr(config, "max_seqlen", 6144))
         )
 
         # TTS-specific
@@ -743,15 +744,15 @@ class Zonos2SGLangModel(nn.Module):
         eoa_id = int(getattr(config, "eoa_id", ZONOS2_EOA_ID))
         audio_pad_id = int(getattr(config, "audio_pad_id", ZONOS2_AUDIO_PAD_ID))
         loss_softcap = float(getattr(config, "loss_softcap", ZONOS2_LOSS_SOFTCAP))
-        text_vocab = getattr(config, "text_vocab", None)
+        text_vocab = getattr(config, "text_vocab", ZONOS2_TEXT_VOCAB)
 
         # MoE-specific
-        moe_n_experts = int(getattr(config, "moe_n_experts", getattr(config, "num_experts", 1)))
+        moe_n_experts = int(getattr(config, "moe_n_experts", getattr(config, "num_experts", 16)))
         num_experts_per_tok = int(getattr(config, "moe_router_topk",
-                                          getattr(config, "num_experts_per_tok", 2)))
-        moe_start_from_layer = int(getattr(config, "moe_start_from_layer", 0))
-        moe_end_from_layer = int(getattr(config, "moe_end_from_layer", 0))
-        moe_router_dim = int(getattr(config, "moe_router_dim", 256))
+                                          getattr(config, "num_experts_per_tok", 1)))
+        moe_start_from_layer = int(getattr(config, "moe_start_from_layer", 3))
+        moe_end_from_layer = int(getattr(config, "moe_end_from_layer", 1))
+        moe_router_dim = int(getattr(config, "moe_router_dim", 128))
         moe_intermediate_size = int(getattr(config, "moe_intermediate_size", intermediate_size))
         moe_balancing_strategy = str(getattr(config, "moe_balancing_strategy", "legacy"))
         special_topk_layers = getattr(config, "special_topk_layers", None)
@@ -761,9 +762,9 @@ class Zonos2SGLangModel(nn.Module):
             }
 
         # Speaker
-        speaker_enabled = bool(getattr(config, "speaker_enabled", False))
-        speaker_embedding_dim = int(getattr(config, "speaker_embedding_dim", 128))
-        speaker_lda_dim = getattr(config, "speaker_lda_dim", None)
+        speaker_enabled = bool(getattr(config, "speaker_enabled", True))
+        speaker_embedding_dim = int(getattr(config, "speaker_embedding_dim", 2048))
+        speaker_lda_dim = getattr(config, "speaker_lda_dim", 1024)
 
         # Set all fields on config
         config.hidden_size = hidden_size

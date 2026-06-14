@@ -7,6 +7,7 @@ import torch
 from sglang_omni.models.zonos2_tts.stages import (
     _resolve_codec_device,
     _slice_batched_dac_waveforms,
+    prepare_dac_codes_for_decode,
 )
 from sglang_omni.models.zonos2_tts.config import Zonos2TTSPipelineConfig
 
@@ -31,6 +32,36 @@ def test_slice_batched_dac_waveforms_accepts_dac_channel_dim() -> None:
     torch.testing.assert_close(trimmed[1], wavs[1, 0, :40])
 
 
+def test_prepare_dac_codes_drops_delay_flush_without_eos() -> None:
+    codes = torch.arange(12 * 9, dtype=torch.long).view(12, 9)
+
+    prepared = prepare_dac_codes_for_decode(
+        codes,
+        n_codebooks=9,
+        audio_pad_id=1025,
+        codebook_size=1024,
+        eos_frame=None,
+    )
+
+    assert prepared is not None
+    assert prepared.shape == (4, 9)
+
+
+def test_prepare_dac_codes_respects_eos_frame_after_deshearing() -> None:
+    codes = torch.arange(12 * 9, dtype=torch.long).view(12, 9)
+
+    prepared = prepare_dac_codes_for_decode(
+        codes,
+        n_codebooks=9,
+        audio_pad_id=1025,
+        codebook_size=1024,
+        eos_frame=2,
+    )
+
+    assert prepared is not None
+    assert prepared.shape == (2, 9)
+
+
 def test_resolve_codec_device_prefers_launcher_gpu_id() -> None:
     assert _resolve_codec_device("cuda:1", 0) == "cuda:0"
     assert _resolve_codec_device("cuda:0", 1) == "cuda:1"
@@ -38,8 +69,14 @@ def test_resolve_codec_device_prefers_launcher_gpu_id() -> None:
 
 def test_default_pipeline_uses_async_talker_and_second_gpu_vocoder() -> None:
     config = Zonos2TTSPipelineConfig(model_path="Zyphra/ZONOS2")
+    stage_names = [stage.name for stage in config.stages]
     stages = {stage.name: stage for stage in config.stages}
 
+    assert stage_names == ["preprocessing", "speaker_encode", "tts_engine", "vocoder"]
+    assert stages["preprocessing"].next == "speaker_encode"
+    assert stages["speaker_encode"].next == "tts_engine"
+    assert stages["speaker_encode"].factory_args["device"] == "cuda:1"
+    assert stages["speaker_encode"].gpu == 1
     assert stages["tts_engine"].factory_args["enable_async_decode"] is True
     assert stages["tts_engine"].gpu == 0
     assert stages["vocoder"].process == "vocoder"
