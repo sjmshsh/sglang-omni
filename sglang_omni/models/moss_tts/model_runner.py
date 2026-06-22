@@ -9,6 +9,7 @@ import torch
 from sglang.srt.layers.sampler import multinomial_with_seed
 
 from sglang_omni.model_runner.base import ModelRunner
+from sglang_omni.models.moss_tts.radix_hash import gpu_radix_row_hash
 from sglang_omni.models.moss_tts.request_builders import _INF_DELAY
 from sglang_omni.scheduling.types import RequestOutput
 
@@ -157,7 +158,10 @@ class MossTTSModelRunner(ModelRunner):
         datas = [sched_req.data for sched_req in requests]
         rows = self._sample_rows(channel_logits, datas, n_vq=n_vq)
 
-        next_token_ids = rows[:, 0].contiguous()
+        next_text = rows[:, 0]
+        next_token_ids = self._row_radix_token_ids(
+            rows, next_text, int(self.model.config.im_end_token_id)
+        )
         result.next_token_ids = next_token_ids
         schedule_batch.output_ids = next_token_ids
         embeds = self.model._prepare_multi_modal_inputs(
@@ -387,6 +391,15 @@ class MossTTSModelRunner(ModelRunner):
         rows[:, 0] = next_text
         rows[:, 1:] = next_audio
         return rows
+
+    @staticmethod
+    def _row_radix_token_ids(
+        rows: torch.Tensor,
+        next_text: torch.Tensor,
+        end_id: int,
+    ) -> torch.Tensor:
+        """Radix-cache token ids for generated MOSS multi-channel rows."""
+        return gpu_radix_row_hash(rows, next_text, end_id)
 
     @staticmethod
     def _as_row_tensor(
