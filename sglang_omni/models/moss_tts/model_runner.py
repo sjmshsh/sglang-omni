@@ -115,13 +115,10 @@ class MossTTSModelRunner(ModelRunner):
 
     @staticmethod
     def _clear_pending_feedback_queue(data: Any) -> None:
-        queue = getattr(data, "pending_feedback_queue", None)
+        queue = data.pending_feedback_queue
         if queue is None:
             return
-        if hasattr(queue, "clear"):
-            queue.clear()
-        else:
-            data.pending_feedback_queue = []
+        queue.clear()
 
     def _write_decode_input_embedding(
         self,
