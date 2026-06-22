@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import torch
 
-from sglang_omni.models.moss_tts.radix_hash import (
+from sglang_omni.utils.radix_hash import (
     RADIX_HASH_SPACE,
     gpu_radix_row_hash,
 )

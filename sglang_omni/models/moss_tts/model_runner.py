@@ -9,9 +9,9 @@ import torch
 from sglang.srt.layers.sampler import multinomial_with_seed
 
 from sglang_omni.model_runner.base import ModelRunner
-from sglang_omni.models.moss_tts.radix_hash import gpu_radix_row_hash
 from sglang_omni.models.moss_tts.request_builders import _INF_DELAY
 from sglang_omni.scheduling.types import RequestOutput
+from sglang_omni.utils.radix_hash import gpu_radix_row_hash
 
 _NEG_INF = float("-inf")
 _INT64_MAX = torch.iinfo(torch.int64).max

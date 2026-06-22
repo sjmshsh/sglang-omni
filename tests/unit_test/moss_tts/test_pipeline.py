@@ -485,7 +485,7 @@ def test_moss_row_cache_keys_are_content_based() -> None:
 
 def test_moss_generated_row_radix_keys_hash_rows_and_keep_im_end() -> None:
     from sglang_omni.models.moss_tts.model_runner import MossTTSModelRunner
-    from sglang_omni.models.moss_tts.radix_hash import RADIX_HASH_SPACE
+    from sglang_omni.utils.radix_hash import RADIX_HASH_SPACE
 
     slot_id = 151656
     audio_end_id = 151653

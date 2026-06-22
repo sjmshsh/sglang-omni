@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Capture-safe GPU radix-key hash for MOSS-TTS generated frames."""
+"""Capture-safe GPU radix-key hash for generated multi-channel rows."""
 
 from __future__ import annotations
 
@@ -57,10 +57,10 @@ def gpu_radix_row_hash(
 ) -> torch.Tensor:
     """Capture-safe radix token ids for a batch of generated rows.
 
-    ``rows`` is ``[B, C]`` int64 (text channel + RVQ codes); ``next_text`` is
-    ``[B]``. Continuing rows get a key in ``[0, hash_space)``; rows whose text
-    channel equals ``end_id`` keep that raw id so existing eos detection fires.
-    device/dtype follow ``rows``.
+    ``rows`` is ``[B, C]`` int64 (primary token channel + auxiliary channels);
+    ``next_text`` is ``[B]``. Continuing rows get a key in ``[0, hash_space)``;
+    rows whose primary token equals ``end_id`` keep that raw id so existing eos
+    detection fires. device/dtype follow ``rows``.
     """
     folded = torch.remainder(poly_row_hash(rows), hash_space)
     return torch.where(next_text == end_id, next_text.to(torch.int64), folded)
