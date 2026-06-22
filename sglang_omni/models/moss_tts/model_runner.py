@@ -85,7 +85,19 @@ class MossTTSModelRunner(ModelRunner):
                 raise RuntimeError("MOSS-TTS prefill requires prompt_rows")
             req_len = int(req.extend_input_len)
             prefix_len = len(req.prefix_indices)
+            output_rows = getattr(data, "output_rows", None)
+            if output_rows:
+                generated = torch.stack(output_rows, dim=0)
+                rows = torch.cat([rows.to(generated.device), generated], dim=0)
+                self._clear_pending_feedback_queue(data)
             current_rows = rows[prefix_len : prefix_len + req_len]
+            if int(current_rows.shape[0]) != req_len:
+                raise RuntimeError(
+                    f"MOSS-TTS prefill row mismatch for {req.rid}: have "
+                    f"{int(current_rows.shape[0])} rows, need {req_len} "
+                    f"(prefix={prefix_len}, prompt={int(data.prompt_rows.shape[0])}, "
+                    f"generated={len(output_rows or [])})"
+                )
             embeds = self.model._prepare_multi_modal_inputs(
                 current_rows.to(device=forward_batch.input_ids.device)
             )
@@ -100,6 +112,16 @@ class MossTTSModelRunner(ModelRunner):
             device=forward_batch.input_ids.device,
             dtype=self.model.dtype,
         )
+
+    @staticmethod
+    def _clear_pending_feedback_queue(data: Any) -> None:
+        queue = getattr(data, "pending_feedback_queue", None)
+        if queue is None:
+            return
+        if hasattr(queue, "clear"):
+            queue.clear()
+        else:
+            data.pending_feedback_queue = []
 
     def _write_decode_input_embedding(
         self,
