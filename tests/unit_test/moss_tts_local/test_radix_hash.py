@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """CPU unit tests for the capture-safe generated-row radix hash.
 
-Imports only ``torch`` and the shared ``utils.radix_hash`` module (no
-model/runtime deps),
+Imports only ``torch`` and the ``radix_hash`` module (no model/runtime deps),
 so the whole file runs on CPU. These cover the *key layer* of the two-layer
 verification rubric in ``docs/design/gpu_radix_hash.md``; the GPU bit-identity
 *output layer* rerun is tracked separately (PENDING-GPU).
@@ -12,7 +11,7 @@ from __future__ import annotations
 
 import torch
 
-from sglang_omni.utils.radix_hash import (
+from sglang_omni.models.moss_tts_local.radix_hash import (
     _BASE,
     _MOD,
     RADIX_HASH_SPACE,

@@ -1,4 +1,25 @@
 # SPDX-License-Identifier: Apache-2.0
+"""Capture-safe GPU radix-key hash for MOSS-TTS Local generated frames.
+
+The scheduler appends one radix-cache token id per generated frame to a
+request's KV chain, and the radix tree keys on those ids. The text channel
+alone is the same assistant-slot id for every continuing frame, so the key
+must hash the full multi-channel row (text + RVQ codes) to keep a radix match
+implying identical audio content.
+
+Prompt rows are hashed once, off the decode hot path, by
+``moss_tts.request_builders.build_row_cache_key_ids`` (host-side blake2b); that
+call is fine to keep -- it never runs inside a CUDA-graph capture region. The
+*generated*-row key, by contrast, is computed every decode step on a tensor
+that the local-frame decode just produced on device. Hashing it host-side
+forces a GPU->CPU sync (``.cpu()``/``numpy``) every frame, which blocks
+CUDA-graph capture and the async-decode lookahead (#734/#736). This module
+hashes the row tensor with a fixed-coefficient polynomial entirely in int64
+torch ops, so it stays on-device and is graph-capturable.
+
+See ``docs/design/gpu_radix_hash.md`` for the capture-safety argument, the
+collision analysis, and the two-layer verification rubric.
+"""
 """Capture-safe GPU radix-key hash for generated multi-channel rows."""
 
 from __future__ import annotations
@@ -6,8 +27,9 @@ from __future__ import annotations
 import torch
 
 # <|endoftext|> = 151643 opens the special/control id band. Generated radix
-# keys fold strictly below it; models keep their own stop id raw so existing
-# eos/vocab-boundary detection still fires.
+# keys fold strictly below it; the scheduler finishes any request whose
+# generated id crosses this boundary (``Req._check_vocab_boundary_finish``), so
+# a real (continuing) audio frame must never land in or above the band.
 RADIX_HASH_SPACE = 151643
 
 # Polynomial-hash constants.
@@ -55,12 +77,12 @@ def gpu_radix_row_hash(
     *,
     hash_space: int = RADIX_HASH_SPACE,
 ) -> torch.Tensor:
-    """Capture-safe radix token ids for a batch of generated rows.
+    """Capture-safe radix token ids for a batch of generated frames.
 
-    ``rows`` is ``[B, C]`` int64 (primary token channel + auxiliary channels);
-    ``next_text`` is ``[B]``. Continuing rows get a key in ``[0, hash_space)``;
-    rows whose primary token equals ``end_id`` keep that raw id so existing eos
-    detection fires. device/dtype follow ``rows``.
+    ``rows`` is ``[B, C]`` int64 (text channel + RVQ codes); ``next_text`` is
+    ``[B]`` (the text-channel id, ``end_id`` for a stop frame). Continuing
+    frames get a key in ``[0, hash_space)``; EOS rows keep the raw ``end_id``
+    so the existing eos detection still fires. device/dtype follow ``rows``.
     """
     folded = torch.remainder(poly_row_hash(rows), hash_space)
     return torch.where(next_text == end_id, next_text.to(torch.int64), folded)

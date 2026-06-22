@@ -483,36 +483,6 @@ def test_moss_row_cache_keys_are_content_based() -> None:
     assert build_row_cache_key_ids(rows) != build_row_cache_key_ids(different)
 
 
-def test_moss_generated_row_radix_keys_hash_rows_and_keep_im_end() -> None:
-    from sglang_omni.models.moss_tts.model_runner import MossTTSModelRunner
-    from sglang_omni.utils.radix_hash import RADIX_HASH_SPACE
-
-    slot_id = 151656
-    audio_end_id = 151653
-    im_end_id = 151645
-    rows = torch.tensor(
-        [
-            [slot_id, 1, 2],
-            [slot_id, 1, 3],
-            [audio_end_id, 1024, 1024],
-            [im_end_id, 1024, 1024],
-        ],
-        dtype=torch.long,
-    )
-    next_text = rows[:, 0]
-
-    out = MossTTSModelRunner._row_radix_token_ids(rows, next_text, im_end_id)
-
-    assert out.dtype == torch.int64
-    assert int(out[3]) == im_end_id
-    assert int(out[0]) != slot_id
-    assert int(out[0]) != int(out[1])
-    assert 0 <= int(out[0]) < RADIX_HASH_SPACE
-    assert 0 <= int(out[1]) < RADIX_HASH_SPACE
-    assert 0 <= int(out[2]) < RADIX_HASH_SPACE
-    assert int(out[2]) != audio_end_id
-
-
 def test_moss_preprocess_and_sglang_request_handoff(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
