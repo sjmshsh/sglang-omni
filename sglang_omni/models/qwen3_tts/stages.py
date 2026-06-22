@@ -21,8 +21,7 @@ from sglang_omni.models.qwen3_tts.request_builders import (
 )
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.generation_batch_policy import (
-    build_default_cuda_graph_bs,
-    sync_cuda_graph_bs_with_max_bs,
+    build_generation_batch_overrides,
     validate_generation_batch_policy,
 )
 from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
@@ -196,23 +195,22 @@ def create_sglang_tts_engine_executor(
         device = f"cuda:{gpu_id}"
     gpu_id = int(device.split(":")[-1]) if ":" in device else 0
 
-    overrides: dict[str, Any] = {
-        "cuda_graph_bs": build_default_cuda_graph_bs(16),
-        "cuda_graph_max_bs": 16,
-        "dtype": dtype,
-        "disable_cuda_graph": False,
-        "disable_overlap_schedule": True,
-        "enable_torch_compile": True,
-        "mem_fraction_static": 0.85,
-        "max_prefill_tokens": 8192,
-        "max_running_requests": 16,
-        "sampling_backend": "pytorch",
-        "torch_compile_max_bs": 16,
-        "trust_remote_code": True,
-    }
-    if server_args_overrides:
-        overrides.update(server_args_overrides)
-        sync_cuda_graph_bs_with_max_bs(overrides, server_args_overrides)
+    overrides = build_generation_batch_overrides(
+        {
+            "cuda_graph_max_bs": 16,
+            "dtype": dtype,
+            "disable_cuda_graph": False,
+            "disable_overlap_schedule": True,
+            "enable_torch_compile": True,
+            "mem_fraction_static": 0.85,
+            "max_prefill_tokens": 8192,
+            "max_running_requests": 16,
+            "sampling_backend": "pytorch",
+            "torch_compile_max_bs": 16,
+            "trust_remote_code": True,
+        },
+        server_args_overrides,
+    )
 
     server_args = build_sglang_server_args(
         checkpoint_dir,

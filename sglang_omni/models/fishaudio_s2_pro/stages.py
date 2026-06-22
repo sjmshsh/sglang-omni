@@ -18,8 +18,7 @@ from sglang_omni.models.fishaudio_s2_pro.request_builders import (
 )
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.generation_batch_policy import (
-    build_default_cuda_graph_bs,
-    sync_cuda_graph_bs_with_max_bs,
+    build_generation_batch_overrides,
     validate_generation_batch_policy,
 )
 
@@ -250,21 +249,20 @@ def create_sglang_tts_engine_executor(
 
     patch_fish_config_for_sglang()
 
-    overrides: dict[str, Any] = {
-        "cuda_graph_bs": build_default_cuda_graph_bs(64),
-        "cuda_graph_max_bs": 64,
-        "disable_cuda_graph": False,
-        "mem_fraction_static": 0.85,
-        "max_running_requests": 64,
-        "chunked_prefill_size": 8192,
-        "dtype": "bfloat16",
-        "enable_torch_compile": True,
-        "torch_compile_max_bs": 64,
-        "random_seed": int.from_bytes(os.urandom(4), "little") & 0x7FFFFFFF,
-    }
-    if server_args_overrides:
-        overrides.update(server_args_overrides)
-        sync_cuda_graph_bs_with_max_bs(overrides, server_args_overrides)
+    overrides = build_generation_batch_overrides(
+        {
+            "cuda_graph_max_bs": 64,
+            "disable_cuda_graph": False,
+            "mem_fraction_static": 0.85,
+            "max_running_requests": 64,
+            "chunked_prefill_size": 8192,
+            "dtype": "bfloat16",
+            "enable_torch_compile": True,
+            "torch_compile_max_bs": 64,
+            "random_seed": int.from_bytes(os.urandom(4), "little") & 0x7FFFFFFF,
+        },
+        server_args_overrides,
+    )
 
     server_args = build_sglang_server_args(
         checkpoint_dir,

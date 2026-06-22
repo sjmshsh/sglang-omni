@@ -43,8 +43,7 @@ from sglang_omni.preprocessing.cache_key import (
     reference_path_cache_key as _reference_path_cache_key,
 )
 from sglang_omni.scheduling.generation_batch_policy import (
-    build_default_cuda_graph_bs,
-    sync_cuda_graph_bs_with_max_bs,
+    build_generation_batch_overrides,
     validate_generation_batch_policy,
 )
 from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
@@ -637,7 +636,6 @@ def create_sglang_tts_engine_executor(
 
     overrides: dict[str, Any] = {
         "dtype": dtype,
-        "cuda_graph_bs": build_default_cuda_graph_bs(16),
         "cuda_graph_max_bs": 16,
         "disable_cuda_graph": False,
         "disable_overlap_schedule": True,
@@ -649,13 +647,11 @@ def create_sglang_tts_engine_executor(
         "trust_remote_code": True,
     }
     if total_gpu_memory_fraction is None:
-        # without a typed stage budget, this path cannot use process-scoped
-        # colocated profiling
-        # keep the legacy static fraction for split/custom deployments
+        # note (luojiaxuan): Without a typed stage budget, this path cannot use
+        # process-scoped colocated profiling, so keep the legacy static fraction
+        # for split/custom deployments.
         overrides["mem_fraction_static"] = 0.6 if torch.cuda.device_count() > 1 else 0.5
-    if server_args_overrides:
-        overrides.update(server_args_overrides)
-        sync_cuda_graph_bs_with_max_bs(overrides, server_args_overrides)
+    overrides = build_generation_batch_overrides(overrides, server_args_overrides)
     memory_budget = _apply_colocated_ar_memory_budget(
         overrides,
         total_gpu_memory_fraction=total_gpu_memory_fraction,
@@ -721,15 +717,11 @@ def create_sglang_tts_engine_executor(
     model = model_worker.model_runner.model
     if want_cuda_graph:
         model_worker.model_runner.init_device_graphs()
-        # Also graph the per-frame local-transformer decode (1 + n_vq
-        # micro-steps and 13 seeded sampling passes per frame): eager it is
-        # kernel-launch-bound at ~22 ms/frame independent of batch size.
-        model.init_frame_decode_graphs(
-            list(
-                overrides.get("cuda_graph_bs")
-                or build_default_cuda_graph_bs(int(overrides["cuda_graph_max_bs"]))
-            )
-        )
+        # note (luojiaxuan): Also graph the per-frame local-transformer decode
+        # (1 + n_vq micro-steps and 13 seeded sampling passes per frame):
+        # eager it is kernel-launch-bound at ~22 ms/frame independent of batch
+        # size.
+        model.init_frame_decode_graphs(list(server_args.cuda_graph_bs))
 
     output_proc = SGLangOutputProcessor(
         capture_hidden=False,

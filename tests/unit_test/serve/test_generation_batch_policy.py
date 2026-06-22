@@ -9,7 +9,7 @@ import pytest
 
 from sglang_omni.scheduling.generation_batch_policy import (
     build_default_cuda_graph_bs,
-    sync_cuda_graph_bs_with_max_bs,
+    build_generation_batch_overrides,
     validate_generation_batch_policy,
 )
 
@@ -117,18 +117,25 @@ def test_validate_generation_batch_policy_rejects_under_sized_model_buffer() -> 
         )
 
 
-def test_sync_cuda_graph_bs_with_max_bs_preserves_explicit_list() -> None:
-    overrides: dict[str, object] = {
+def test_build_generation_batch_overrides_preserves_explicit_list() -> None:
+    defaults: dict[str, object] = {
         "cuda_graph_max_bs": 16,
         "cuda_graph_bs": [1, 2, 4, 8, 12, 16],
     }
     server_args_overrides = {"cuda_graph_max_bs": 32, "cuda_graph_bs": [1, 4, 32]}
-    overrides.update(server_args_overrides)
-    sync_cuda_graph_bs_with_max_bs(overrides, server_args_overrides)
+    overrides = build_generation_batch_overrides(defaults, server_args_overrides)
     assert overrides["cuda_graph_bs"] == [1, 4, 32]
+    assert defaults["cuda_graph_bs"] == [1, 2, 4, 8, 12, 16]
 
 
-def test_sync_cuda_graph_bs_with_max_bs_fills_missing_list() -> None:
-    overrides: dict[str, object] = {"cuda_graph_max_bs": 32}
-    sync_cuda_graph_bs_with_max_bs(overrides, {"cuda_graph_max_bs": 32})
+def test_build_generation_batch_overrides_fills_default_list() -> None:
+    overrides = build_generation_batch_overrides({"cuda_graph_max_bs": 32})
+    assert overrides["cuda_graph_bs"] == [1, 2, 4, 8, 12, 16, 24, 32]
+
+
+def test_build_generation_batch_overrides_recomputes_list_when_max_changes() -> None:
+    overrides = build_generation_batch_overrides(
+        {"cuda_graph_max_bs": 16},
+        {"cuda_graph_max_bs": 32},
+    )
     assert overrides["cuda_graph_bs"] == [1, 2, 4, 8, 12, 16, 24, 32]
