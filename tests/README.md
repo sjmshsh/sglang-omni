@@ -11,7 +11,7 @@ tests/
 │   ├── test_qwen3_omni_*_ci.py
 │   ├── test_qwen3_omni_videoamme_talker_tp2_ci.py
 │   ├── test_tts_ci.py
-│   └── test_qwen3_asr_ci.py
+│   └── test_asr_ci.py
 └── unit_test/
     ├── benchmarks/
     │   └── test_dataset_regressions.py
@@ -167,7 +167,7 @@ Relevant model CI ownership:
   router at TTS generation concurrency 16 and verifies both colocated workers
   receive traffic. WER reuses saved audio after the Qwen3-Omni server is
   stopped, then transcribes through Qwen3-ASR at concurrency 32.
-- `test_qwen3_asr_ci.py`: Qwen3-ASR correctness + speed via SGLang Omni
+- `test_asr_ci.py`: Qwen3-ASR correctness + speed via SGLang Omni
   router (`/v1/audio/transcriptions`). Uses the full 1088-sample English
   SeedTTS set; writes `qwen3_asr_results.json` for threshold calibration
   (`qwen3-asr-v1` in `tune-ci-thresholds`). Its stdout uses the same boxed
