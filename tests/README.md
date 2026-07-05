@@ -36,6 +36,8 @@ tests/
     │   ├── test_stage.py
     │   ├── test_stage_process_env.py
     │   └── test_stage_streaming.py
+    ├── models/
+    │   └── test_model_capabilities.py
     ├── qwen3_omni/
     │   ├── test_cli.py
     │   ├── test_code2wav.py
@@ -288,6 +290,9 @@ that happened to contain an older version of the test.
 - `unit_test/utils/`: Shared utility tests:
   - audio loading helpers for data URIs, file URIs, HTTP URLs, timeout fallback,
     and mono/channel preservation.
+- `unit_test/models/`: Model registry and cross-model contract tests:
+  - static TTS `ModelCapabilities` declarations, registry lookup, aliases, and
+    launcher startup logging.
 - `unit_test/qwen3_asr/`: Qwen3-ASR unit tests:
   - pipeline config and stage factory concurrency defaults
   - single-source audio token length formula used by both processor and
